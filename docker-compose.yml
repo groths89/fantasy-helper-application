@@ -1,20 +1,28 @@
 services:
   # --- FastAPI Backend ---
   backend:
-    build: ./backend
+    # Build on GitHub, Pull on Lightsail
+    image: ghcr.io/groths89/fantasy-helper-application-api:latest
     container_name: fantasy_helper_app_api
     restart: always
     env_file: .env
     depends_on:
       - redis
+    environment:
+      # Tell FastAPI where to find Redis within the Docker network
+      - REDIS_URL=redis://redis:6379/0
     networks:
       - gateway-network
 
   # --- React Frontend ---
   frontend:
-    build: ./frontend
+    # Use the pre-built image from GitHub instead of building locally
+    image: ghcr.io/groths89/fantasy-helper-application-ui:latest
     container_name: fantasy_helper_app_ui
     restart: always
+    # This environment section is where you'd link your backend API
+    environment:
+      - VITE_API_URL=https://api.gregsfantasyhelper.solutions
     networks:
       - gateway-network
 
