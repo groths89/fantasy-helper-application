@@ -12,7 +12,7 @@ services:
       # Tell FastAPI where to find Redis within the Docker network
       - REDIS_URL=redis://redis:6379/0
     networks:
-      - gateway-network
+      - gateway_network
 
   # --- React Frontend ---
   frontend:
@@ -24,7 +24,7 @@ services:
     environment:
       - VITE_API_URL=https://api.gregsfantasyhelper.solutions
     networks:
-      - gateway-network
+      - gateway_network
 
   # --- Persistence Layer ---
   redis:
@@ -35,10 +35,10 @@ services:
     volumes:
       - redis_data:/data
     networks:
-      - gateway-network
+      - gateway_network
 
 networks:
-  gateway-network:
+  gateway_network:
     external: true
 
 volumes:
