@@ -2,6 +2,9 @@
 fastapi[standard]==0.135.1
 uvicorn==0.41.0
 
+# Auth & OAuth
+httpx-oauth==0.16.1
+
 # Data & MLB API
 python-mlb-statsapi==0.7.2
 pandas==3.0.1
@@ -10,3 +13,5 @@ pydantic==2.12.5
 # Utilities
 python-multipart==0.0.20
 httpx==0.28.1
+python-dotenv==1.0.1
+redis==5.0.1
