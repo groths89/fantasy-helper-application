@@ -1,14 +1,44 @@
-name: Build and Push to GHCR
-on: [push]
+name: Build and Deploy
+on:
+  push:
+    branches: [ main ]
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Log in to GHCR
+
+      - name: Log in to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-      - name: Build and Push
+
+      - name: Build and Push Images
         run: |
-          docker build -t ghcr.io/${{ github.repository_owner }}/fantasy_helper_app_ui:latest ./frontend
-          docker push ghcr.io/${{ github.repository_owner }}/fantasy_helper_app_ui:latest
+          # Build Frontend
+          docker build -t ghcr.io/${{ github.repository_owner }}/fantasy-helper-application:latest ./frontend
+          docker push ghcr.io/${{ github.repository_owner }}/fantasy-helper-application:latest
+          
+          # Build Backend
+          docker build -t ghcr.io/${{ github.repository_owner }}/fantasy-helper-application:latest ./backend
+          docker push ghcr.io/${{ github.repository_owner }}/fantasy-helper-application:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH into Lightsail and Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.LIGHTSAIL_IP }}
+          username: ec2-user
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/fantasy-helper-application
+            # Login to GHCR on the server
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            # Pull latest images and restart
+            docker compose pull
+            docker compose up -d
