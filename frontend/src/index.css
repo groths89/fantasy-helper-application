@@ -1,0 +1,26 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+@layer base {
+  body {
+    @apply bg-gray-100 text-gray-800 font-sans antialiased;
+  }
+
+  /* Add some base styles for form elements for a consistent look */
+  input,
+  textarea,
+  select,
+  button {
+    @apply rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2;
+  }
+
+  button {
+    @apply bg-primary-600/90 hover:bg-primary-700 text-white font-bold py-2 px-4 transition-colors;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-white rounded-lg shadow-md p-4 sm:p-6;
+  }
+}

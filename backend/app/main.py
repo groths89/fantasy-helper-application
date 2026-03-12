@@ -1,0 +1,518 @@
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from typing import List, Optional
+import pandas as pd
+import os
+from io import StringIO
+import httpx
+
+# Import from the apps logic
+from app.auth import yahoo_client, token_storage, get_valid_token
+from app.engine.sgp import engine
+from app.engine.projections import fetch_2026_projections
+from app.engine.statcast import get_anti_tilt_metrics
+from app.engine.ai_assistant import generate_recommendations
+from app.engine.points_calc import PointsEngine
+
+points_engine = PointsEngine()
+
+app = FastAPI(title="Fantasy Baseball Helper API")
+
+# --- CORS Setup ---
+# Essential for React Frontend to talk to this API
+origins = [
+    "http://localhost:5173", # Vite default
+    "http://localhost:3000", # Create React App default
+    "http://localhost",
+]
+
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=origins,
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"]
+)
+
+# --- Pydantic Models (data contracts)
+class PlayerRank(BaseModel):
+  id: int
+  name: str
+  # Hitting
+  HR: Optional[int] = 0
+  SB: Optional[int] = 0
+  RBI: Optional[int] = 0
+  R: Optional[int] = 0
+  AVG: Optional[float] = 0.0
+  # Pitching
+  W: Optional[int] = 0
+  L: Optional[int] = 0
+  IP: Optional[float] = 0.0
+  SV: Optional[int] = 0
+  HLD: Optional[int] = 0
+  SO: Optional[int] = 0
+  ERA: Optional[float] = 0.0
+  WHIP: Optional[float] = 0.0
+  H_allowed: Optional[int] = 0
+  BB_allowed: Optional[int] = 0
+  sgp_value: Optional[float] = None
+  total_points: Optional[float] = None
+  vorp: Optional[float] = None
+  position: Optional[str] = None
+  tier: Optional[int] = None
+
+class AntiTiltResponse(BaseModel):
+  player_id: int
+  patience_score: int
+  luck_delta: float
+  recommendation: str
+
+class RecommendationRequest(BaseModel):
+    team: List[PlayerRank]
+    last_drafted: Optional[PlayerRank] = None
+    roster_settings: dict
+    players: List[PlayerRank] # The full ranked list from the frontend
+    all_taken_players: List[PlayerRank]
+
+
+# --- Endpoints ---
+
+@app.get("/")
+async def root():
+  return {"message": "Hello World"}
+
+@app.get("/api/v1/health")
+async def health():
+  return {
+    "status": "ready"
+  }
+
+@app.get("/api/v1/draft/player-value")
+async def get_value(hr: int, sb: int, rbi: int, r: int, avg: float):
+  """
+  Calculates SGP value on the fly for manual inputs.
+  """
+  stats = {'HR': hr, 'SB': sb, 'RBI': rbi, 'R': r, 'AVG': avg}
+
+  replacement = {
+    'HR': 22, 
+    'SB': 12, 
+    'RBI': 70, 
+    'R': 75, 
+    'AVG': .265
+  }
+
+  # Calling your SGPEngine from engine/sgp.py
+  value = engine.calculate_player_value(stats, replacement)
+    
+  return {
+    "sgp_value": value
+  }
+
+@app.get("/api/v1/draft/rankings", response_model=List[PlayerRank])
+async def get_rankings(scoring: str = 'h2h', skip: int = 0, limit: int = 5000):
+  """
+  Pulls projections and runs them through the appropriate engine.
+  'h2h' for Head-to-Head points/VORP, 'sgp' for Standings Gain Points.
+  Supports pagination with `skip` and `limit`.
+  """
+  try:
+    df = fetch_2026_projections()
+    
+    if scoring == 'h2h':
+        # Calculate Total Points first
+        def calculate_points(row):
+            points = 0
+            # If player has pitching stats (IP > 0), calculate pitching points
+            if row.get('IP', 0) > 0: # Assuming IP > 0 means they are a pitcher
+                pitching_points = 0
+                pitching_points += row.get('IP', 0) * 3
+                pitching_points += row.get('SO', 0) * 1
+                pitching_points += row.get('W', 0) * 7
+                pitching_points += row.get('L', 0) * -5
+                pitching_points += row.get('SV', 0) * 7
+                pitching_points += row.get('HLD', 0) * 5
+                pitching_points += row.get('ER', 0) * -2
+                pitching_points += row.get('H_allowed', 0) * -1
+                pitching_points += row.get('BB_allowed', 0) * -1
+                points += pitching_points
+            # If player has hitting stats (AB > 0), calculate hitting points
+            if row.get('AB', 0) > 0:
+                points += points_engine.calculate_hitter_points(row)
+            return points
+
+        df['total_points'] = df.apply(calculate_points, axis=1)
+        
+        # Then calculate VORP (Value Over Replacement)
+        df['vorp'] = df.apply(
+            lambda x: points_engine.calculate_vorp(x['total_points'], x.get('position', 'Util')), 
+            axis=1
+        )
+        sort_col = 'vorp'
+    
+    elif scoring == 'sgp':
+        df['sgp_value'] = df.apply(
+            lambda x: engine.calculate_player_value(x), 
+            axis=1
+        )
+        sort_col = 'sgp_value'
+    
+    else:
+        raise HTTPException(status_code=400, detail="Invalid scoring system. Use 'sgp' or 'h2h'.")
+        
+    df = df.sort_values(by=sort_col, ascending=False)
+
+    # Tiering Logic
+    if not df.empty:
+      tiers = []
+      current_tier = 1
+      last_value = df.iloc[0][sort_col]
+
+      # These values are subjective and can be tuned.
+      tier_drop_h2h = 20.0 # VORP points
+      tier_drop_sgp = 1.0  # SGP points
+      threshold = tier_drop_h2h if scoring == 'h2h' else tier_drop_sgp
+
+      tiers.append(current_tier)
+
+      for index, row in df.iloc[1:].iterrows():
+          value = row[sort_col]
+          if (last_value - value) > threshold:
+              current_tier += 1
+          tiers.append(current_tier)
+          last_value = value
+      df['tier'] = tiers
+    
+    paginated_df = df.iloc[skip:skip+limit]
+
+    return paginated_df.to_dict(orient='records')
+  except Exception as e:
+    print(f"ERROR: {e}")
+    raise HTTPException(status_code=500, detail=str(e))
+  
+@app.post("/api/v1/draft/recommendations")
+async def get_ai_recommendations(request: RecommendationRequest):
+    """
+    Generates AI-driven draft recommendations based on the current draft state.
+    """
+    try:
+        # The 'players' list from the frontend is already sorted by rank.
+        recommendations = generate_recommendations(
+            team=[p.dict() for p in request.team],
+            last_drafted=request.last_drafted.dict() if request.last_drafted else None,
+            roster_settings=request.roster_settings,
+            players=[p.dict() for p in request.players],
+            all_taken_players=[p.dict() for p in request.all_taken_players]
+        )
+        return recommendations
+    except Exception as e:
+        # Using print for simple logging; a real app would use a logging library
+        print(f"ERROR in AI Recommendations: {e}")
+        # Return a generic error to the client
+        raise HTTPException(status_code=500, detail="An error occurred while generating recommendations.")
+
+@app.post("/api/v1/projections/upload/{player_type}")
+async def upload_projections(player_type: str, file: UploadFile = File(...)):
+  """
+  Uploads a new projections CSV file for either 'hitters' or 'pitchers'.
+  It validates the file and overwrites the corresponding existing one.
+  """
+  if player_type not in ["hitters", "pitchers"]:
+      raise HTTPException(status_code=400, detail="Invalid player type. Must be 'hitters' or 'pitchers'.")
+
+  if not file.filename.endswith('.csv'):
+    raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV.")
+
+  # FantasyPros exports should have 'Player'
+  required_cols = {'Player'}
+
+  try:
+    contents = await file.read()
+    df = pd.read_csv(StringIO(contents.decode('utf-8')))
+
+    if not required_cols.issubset(df.columns):
+        missing_cols = required_cols - set(df.columns)
+        raise HTTPException(status_code=400, detail=f"CSV is missing required columns: {missing_cols}")
+
+  except Exception as e:
+      if isinstance(e, HTTPException):
+          raise e
+      raise HTTPException(status_code=400, detail=f"Error processing CSV file: {e}")
+
+  try:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_name = "hitter_projections.csv" if player_type == "hitters" else "pitcher_projections.csv"
+    csv_path = os.path.join(base_dir, 'data', file_name)
+
+    with open(csv_path, "wb") as buffer:
+        buffer.write(contents)
+  except Exception as e:
+      raise HTTPException(status_code=500, detail=f"Could not save file: {e}")
+
+  return {"message": f"Successfully uploaded {player_type} projections from {file.filename}."}
+
+@app.get("/api/v1/players/{player_id}/anti-tilt", response_model=AntiTiltResponse)
+async def get_player_anti_tilt(player_id: int):
+  """
+  Checks Statcast data to see if a player is getting unlucky
+  """
+  metrics = get_anti_tilt_metrics(player_id)
+  if not metrics:
+    raise HTTPException(status_code=404, detail="Player not found")
+  return metrics
+
+YAHOO_REDIRECT_URI = "http://localhost:8000/auth/yahoo/callback"
+
+@app.get("/auth/yahoo")
+async def yahoo_login():
+    """Redirects user to Yahoo for authentication."""
+    authorization_url = await yahoo_client.get_authorization_url(
+        scope="fspt-r", # Read-only fantasy sports
+        redirect_uri=os.getenv("YAHOO_REDIRECT_URI"),
+    )
+    return RedirectResponse(authorization_url)
+
+@app.get("/auth/yahoo/callback")
+async def yahoo_callback(code: str):
+    """Handles the callback from Yahoo after user authorization."""
+    token = await yahoo_client.get_access_token(code, redirect_uri=os.getenv("YAHOO_REDIRECT_URI"),)
+    # For simplicity, storing the token in memory.
+    # In a real app, you'd associate this with a user session/ID and store it securely.
+    token_storage["yahoo_token"] = token
+    print("Successfully obtained Yahoo token.")
+    # Redirect user back to the dashboard
+    return RedirectResponse(url="http://localhost:5173/")
+
+# NOTE: This is for development and testing only.
+# It allows the UI to be tested without a real Yahoo login.
+# In a production environment, this endpoint should be disabled.
+@app.get("/auth/yahoo/mock")
+async def yahoo_mock_login():
+    """Mocks a Yahoo login for development."""
+    # Create a fake token. The content doesn't matter much for the UI,
+    # as long as it exists in token_storage.
+    token_storage["yahoo_token"] = {
+        "access_token": "mock_access_token",
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "refresh_token": "mock_refresh_token",
+        "scope": "fspt-r",
+    }
+    print("Successfully obtained MOCK Yahoo token.")
+    # Redirect user back to the frontend dashboard
+    return RedirectResponse(url="http://localhost:5173/")
+
+@app.get("/auth/status")
+async def auth_status():
+    """Checks if the user is authenticated with Yahoo."""
+    return {"is_connected": "yahoo_token" in token_storage}
+
+@app.get("/auth/logout")
+async def logout():
+    """Logs the user out by clearing their session token."""
+    if "yahoo_token" in token_storage:
+        token_storage.pop("yahoo_token", None)
+        print("User logged out, token cleared")
+    return {"message": "Successfully logged out"}
+
+def _parse_yahoo_resource(resource_list):
+    """
+    Helper to convert Yahoo's list-of-dicts-with-one-key format to a single dict.
+    e.g., [{'key': 'val'}, {'key2': 'val2'}] -> {'key': 'val', 'key2': 'val2'}
+    """
+    if not isinstance(resource_list, list):
+        return resource_list
+    
+    data = {}
+    for item in resource_list:
+        if isinstance(item, dict):
+            data.update(item)
+    return data
+
+@app.get("/api/v1/dashboard")
+async def get_dashboard():
+    token = await get_valid_token()
+    if not token:
+        raise HTTPException(status_code=401, detail="Not connected to Yahoo. Please login.")
+    
+    async with httpx.AsyncClient(
+        headers={"Authorization": f"Bearer {token['access_token']}"},
+        params={"format": "json"}
+    ) as client:
+        try:
+            # 1. Get current MLB game key
+            user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games"
+            res = await client.get(user_games_url)
+            res.raise_for_status()
+            games = res.json()['fantasy_content']['users']['0']['user'][1]['games']
+            
+            mlb_game = None
+            for i in range(games['count']):
+                game_data = games[str(i)]['game'][0]
+                if game_data.get('code') == 'mlb' and game_data.get('season') == '2026':
+                    mlb_game = game_data
+                    break
+            
+            if not mlb_game:
+                raise HTTPException(status_code=404, detail="No 2026 MLB fantasy game found for this user.")
+            game_key = mlb_game['game_key']
+
+            # 2. Get user's team and league key
+            user_teams_url = f"https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys={game_key}/teams"
+            res = await client.get(user_teams_url)
+            res.raise_for_status()
+            team_list_raw = res.json()['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']
+            
+            # Assuming user has one team in the league
+            my_team_raw = team_list_raw['0']['team'][0]
+            my_team = _parse_yahoo_resource(my_team_raw)
+            my_team_key = my_team['team_key']
+            league_key = my_team['league_key']
+
+            # 3. Get Standings
+            standings_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{league_key}/standings"
+            res = await client.get(standings_url)
+            res.raise_for_status()
+            teams_raw = res.json()['fantasy_content']['league'][1]['standings'][0]['teams']
+
+            standings = []
+            for i in range(teams_raw['count']):
+                team_data_raw = teams_raw[str(i)]['team'][0]
+                team_data = _parse_yahoo_resource(team_data_raw)
+                outcome = team_data['team_standings']['outcome_totals']
+                record = f"{outcome['wins']}-{outcome['losses']}-{outcome['ties']}"
+                standings.append({
+                    "rank": int(team_data['team_standings']['rank']),
+                    "name": team_data['name'],
+                    "record": record,
+                    "highlight": team_data['team_key'] == my_team_key
+                })
+
+            # 4. Get Matchup
+            matchup_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_team_key}/matchups"
+            res = await client.get(matchup_url)
+            res.raise_for_status()
+            matchup_data = res.json()['fantasy_content']['team'][1]['matchups']['0']['matchup']
+            
+            teams_in_matchup = matchup_data['0']['teams']
+            team1_data = _parse_yahoo_resource(teams_in_matchup['0']['team'][0])
+            team2_data = _parse_yahoo_resource(teams_in_matchup['1']['team'][0])
+
+            my_matchup_team, opponent_matchup_team = (team1_data, team2_data) if team1_data['team_key'] == my_team_key else (team2_data, team1_data)
+
+            my_score = float(_parse_yahoo_resource(my_matchup_team['team_points'])['total'])
+            opponent_score = float(_parse_yahoo_resource(opponent_matchup_team['team_points'])['total'])
+            
+            my_team_record_raw = my_matchup_team['team_standings']['outcome_totals']
+            my_team_record = f"{my_team_record_raw['wins']}-{my_team_record_raw['losses']}-{my_team_record_raw['ties']}"
+            opponent_record_raw = opponent_matchup_team['team_standings']['outcome_totals']
+            opponent_record = f"{opponent_record_raw['wins']}-{opponent_record_raw['losses']}-{opponent_record_raw['ties']}"
+
+            matchup = {
+                "team_name": my_matchup_team['name'],
+                "team_owner": _parse_yahoo_resource(my_matchup_team['managers'][0]['manager'])['nickname'],
+                "team_record": my_team_record,
+                "team_score": my_score,
+                "opponent_name": opponent_matchup_team['name'],
+                "opponent_owner": _parse_yahoo_resource(opponent_matchup_team['managers'][0]['manager'])['nickname'],
+                "opponent_record": opponent_record,
+                "opponent_score": opponent_score,
+                "winning": my_score > opponent_score
+            }
+
+            # 5. Get Roster to generate recommendations
+            roster_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_team_key}/roster"
+            res = await client.get(roster_url)
+            res.raise_for_status()
+            roster_raw = res.json()['fantasy_content']['team'][1]['roster']['0']['players']
+
+            my_roster_player_names = []
+            for i in range(roster_raw['count']):
+                player_data_raw = roster_raw[str(i)]['player'][0]
+                player_data = _parse_yahoo_resource(player_data_raw)
+                my_roster_player_names.append(player_data['name']['full'])
+
+            # 6. Generate Strategy Recommendations
+            recommendations = []
+            if my_roster_player_names:
+                projections_df = fetch_2026_projections()
+                # Limit to avoid too many recommendations
+                recs_generated = 0
+                for player_name in my_roster_player_names:
+                    if recs_generated >= 3: # Limit to 3 recommendations
+                        break
+                    
+                    player_row = projections_df.loc[projections_df['name'] == player_name]
+                    if not player_row.empty:
+                        player_id = int(player_row.iloc[0]['id'])
+                        
+                        # Generate anti-tilt metrics for this player
+                        anti_tilt_metrics = get_anti_tilt_metrics(player_id)
+                        if anti_tilt_metrics and anti_tilt_metrics.get('recommendation'):
+                            recommendations.append({
+                                "type": "success" if "unlucky" in anti_tilt_metrics['recommendation'].lower() else "warning",
+                                "message": f"{player_name}: {anti_tilt_metrics['recommendation']}"
+                            })
+                            recs_generated += 1
+
+            # 7. Return combined data
+            return {
+                "matchup": matchup,
+                "standings": sorted(standings, key=lambda x: x['rank']),
+                # NOTE: Yahoo transaction parsing is complex and is stubbed for now.
+                "activity": [
+                    {"id": 1, "time": "2 hours ago", "team": "Team A", "action": "dropped", "player": "Player X", "added": "Player Y"},
+                    {"id": 2, "time": "4 hours ago", "team": "Team B", "action": "added", "player": "Player Z", "type": "FA"},
+                ],
+                "strategy": {"recommendations": recommendations}
+            }
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                # Token likely expired, clear it and force re-login
+                token_storage.pop("yahoo_token", None)
+                raise HTTPException(status_code=401, detail="Yahoo token expired or invalid. Please re-authenticate.")
+            print(f"Yahoo API Error: {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=f"Error fetching data from Yahoo: {e.response.text}")
+        except (KeyError, IndexError) as e:
+            print(f"Error parsing Yahoo API response: {e}")
+            raise HTTPException(status_code=500, detail="Error parsing data from Yahoo. The API response structure may have changed.")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
+
+@app.get("/api/v1/dashboard/mock")
+async def get_dashboard_mock():
+    """Returns the original mock data for the dashboard."""
+    return {
+        "matchup": {
+            "team_name": "Bronx Bombers",
+            "team_owner": "Gregory R.",
+            "team_record": "4-0",
+            "team_score": 5,
+            "opponent_name": "Soto Shuffle",
+            "opponent_owner": "Juan S.",
+            "opponent_record": "2-2",
+            "opponent_score": 4,
+            "winning": True
+        },
+        "standings": [
+            {"rank": 1, "name": "Bronx Bombers", "record": "84-20-4", "highlight": True},
+            {"rank": 2, "name": "Soto Shuffle", "record": "80-25-3", "highlight": False},
+            {"rank": 3, "name": "Judge & Jury", "record": "78-28-2", "highlight": False},
+            {"rank": 4, "name": "Witt's End", "record": "75-30-5", "highlight": False},
+            {"rank": 5, "name": "Acuna Matata", "record": "70-35-0", "highlight": False},
+        ],
+        "activity": [
+            {"id": 1, "time": "2 hours ago", "team": "Team A", "action": "dropped", "player": "Player X", "added": "Player Y"},
+            {"id": 2, "time": "4 hours ago", "team": "Team B", "action": "added", "player": "Player Z", "type": "FA"},
+            {"id": 3, "time": "1 day ago", "team": "Team C", "action": "traded", "details": "Traded Player A for Player B"}
+        ],
+        "strategy": {
+             "recommendations": [
+                 {"type": "success", "message": "Elly De La Cruz has a .190 AVG but a .265 xBA (Statcast). Do not panic sell."},
+                 {"type": "warning", "message": "G. Cole is starting today but has a high xERA vs TB. Consider benching."}
+             ]
+        }
+    }

@@ -1,0 +1,37 @@
+services:
+  # --- FastAPI Backend ---
+  backend:
+    build: ./backend
+    container_name: fantasy_helper_app_api
+    restart: always
+    env_file: .env
+    depends_on:
+      - redis
+    networks:
+      - gateway-network
+
+  # --- React Frontend ---
+  frontend:
+    build: ./frontend
+    container_name: fantasy_helper_app_ui
+    restart: always
+    networks:
+      - gateway-network
+
+  # --- Persistence Layer ---
+  redis:
+    image: redis:alpine
+    container_name: fantasy_helper_app_cache
+    restart: always
+    command: redis-server --save 60 1
+    volumes:
+      - redis_data:/data
+    networks:
+      - gateway-network
+
+networks:
+  gateway-network:
+    external: true
+
+volumes:
+  redis_data:
