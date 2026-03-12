@@ -36,7 +36,7 @@ jobs:
           username: ec2-user
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd ~/fantasy-helper-application
+            cd ~/docker/fantasy-helper-application
             # Login to GHCR on the server
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             # Pull latest images and restart
