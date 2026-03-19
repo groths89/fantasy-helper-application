@@ -28,10 +28,14 @@ app.include_router(router)
 # --- CORS Setup ---
 # Essential for React Frontend to talk to this API
 origins = [
-    "http://api.gregsfantasyhelper.solutions",
-    "https://api.gregsfantasyhelper.solutions",
-    "http://localhost:5173", # Vite default
-    "http://localhost:3000", # Create React App default
+    # The Frontend Production URLs
+    "http://gregsfantasyhelper.solutions",
+    "https://gregsfantasyhelper.solutions",
+    "http://dock.gregsfantasyhelper.solutions",
+    
+    # Development URLs
+    "http://localhost:5173", 
+    "http://localhost:3000",
     "http://localhost",
 ]
 
