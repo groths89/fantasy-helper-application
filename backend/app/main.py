@@ -302,7 +302,7 @@ YAHOO_REDIRECT_URI = "https://api.gregsfantasyhelper.solutions/auth/yahoo/callba
 async def yahoo_login():
     """Redirects user to Yahoo for authentication."""
     authorization_url = await yahoo_client.get_authorization_url(
-        scope="fspt-r", # Read-only fantasy sports
+        scope="openid fspt-r",
         redirect_uri=os.getenv("YAHOO_REDIRECT_URI"),
     )
     return RedirectResponse(authorization_url)
@@ -335,7 +335,7 @@ async def yahoo_mock_login():
     }
     print("Successfully obtained MOCK Yahoo token.")
     # Redirect user back to the frontend dashboard
-    return RedirectResponse(url="https://https://api.gregsfantasyhelper.solutions/")
+    return RedirectResponse(url="https://gregsfantasyhelper.solutions/")
 
 @app.get("/auth/status")
 async def auth_status():
