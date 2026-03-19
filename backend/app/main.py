@@ -296,7 +296,7 @@ async def get_player_anti_tilt(player_id: int):
     raise HTTPException(status_code=404, detail="Player not found")
   return metrics
 
-YAHOO_REDIRECT_URI = "https://https://api.gregsfantasyhelper.solutions/auth/yahoo/callback"
+YAHOO_REDIRECT_URI = "https://api.gregsfantasyhelper.solutions/auth/yahoo/callback"
 
 @app.get("/auth/yahoo")
 async def yahoo_login():
