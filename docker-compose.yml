@@ -4,6 +4,9 @@ services:
     # Build on GitHub, Pull on Lightsail
     image: ghcr.io/groths89/fantasy-helper-application-api:latest
     container_name: fantasy_helper_app_api
+    volumes:
+      - ./data:/app/data
+      - ./bot_logs.jsonl:/app/bot_logs.jsonl
     restart: always
     env_file: .env
     depends_on:
@@ -20,9 +23,6 @@ services:
     image: ghcr.io/groths89/fantasy-helper-application-ui:latest
     container_name: fantasy_helper_app_ui
     restart: always
-    # This environment section is where you'd link your backend API
-    environment:
-      - VITE_API_URL=https://api.gregsfantasyhelper.solutions
     networks:
       - gateway_network
 
