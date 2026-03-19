@@ -308,7 +308,7 @@ async def yahoo_login():
     return RedirectResponse(authorization_url)
 
 @app.get("/auth/yahoo/callback")
-async def yahoo_callback(code: str):
+async def yahoo_callback(code: Optional[str] = None):
     """Handles the callback from Yahoo after user authorization."""
     token = await yahoo_client.get_access_token(code, redirect_uri=os.getenv("YAHOO_REDIRECT_URI"),)
     # For simplicity, storing the token in memory.
