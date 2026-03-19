@@ -1,5 +1,6 @@
 import React from 'react';
 import { Zap, TrendingUp, AlertCircle, CheckCircle } from 'lucide-react';
+import AutomationLogs from './AutomationLogs';
 
 const StrategyCenter = ({ strategy }) => {
   if (!strategy) return <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 animate-pulse h-64"></div>;
@@ -49,6 +50,10 @@ const StrategyCenter = ({ strategy }) => {
                 View All Recommendations
           </button>
         </div>
+      </div>
+      
+      <div className="mt-8">
+        <AutomationLogs />
       </div>
     </div>
   );
