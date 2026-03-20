@@ -1,5 +1,7 @@
 import React, { createContext, useState, useEffect, useContext } from 'react';
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+
 const AuthContext = createContext(null);
 
 export const AuthProvider = ({ children }) => {
@@ -8,7 +10,7 @@ export const AuthProvider = ({ children }) => {
 
   useEffect(() => {
     // Check auth status when the component mounts
-    fetch('http://localhost:8000/auth/status')
+    fetch(`${API_BASE}/auth/status`)
       .then(response => {
         if (!response.ok) {
           throw new Error('Network response was not ok');
@@ -29,7 +31,7 @@ export const AuthProvider = ({ children }) => {
 
   const logout = async () => {
     try {
-      await fetch('http://localhost:8000/auth/logout');
+      await fetch(`${API_BASE}/auth/logout`);
       setIsConnected(false);
       window.location.href = '/'; // Redirect to home and let it reload
     } catch (error) {
