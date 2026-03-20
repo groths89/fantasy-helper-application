@@ -10,7 +10,7 @@ import httpx
 import asyncio
 
 # Import from the apps logic
-from app.auth import yahoo_client, token_storage, get_valid_token
+from app.auth import yahoo_client, save_token, get_token, get_valid_token
 from app.engine.sgp import engine
 from app.engine.projections import fetch_2026_projections
 from app.engine.statcast import get_anti_tilt_metrics
@@ -303,7 +303,7 @@ YAHOO_REDIRECT_URI = "https://api.gregsfantasyhelper.solutions/auth/yahoo/callba
 async def yahoo_login():
     """Redirects user to Yahoo for authentication."""
     authorization_url = await yahoo_client.get_authorization_url(
-        scope="fspt-r",
+        scope="openid fspt-r",
         redirect_uri=YAHOO_REDIRECT_URI,
     )
     return RedirectResponse(authorization_url)
@@ -317,10 +317,7 @@ async def yahoo_callback(code: Optional[str] = None, error: Optional[str] = None
         raise HTTPException(status_code=400, detail="Missing authorization code")
 
     token = await yahoo_client.get_access_token(code, redirect_uri=YAHOO_REDIRECT_URI)
-    # For simplicity, storing the token in memory.
-    # In a real app, you'd associate this with a user session/ID and store it securely.
-    token_storage["yahoo_token"] = token
-    print("Successfully obtained Yahoo token.")
+    save_token(token)
     # Redirect user back to the dashboard
     return RedirectResponse(url="https://gregsfantasyhelper.solutions/")
 
@@ -331,29 +328,34 @@ async def yahoo_callback(code: Optional[str] = None, error: Optional[str] = None
 async def yahoo_mock_login():
     """Mocks a Yahoo login for development."""
     # Create a fake token. The content doesn't matter much for the UI,
-    # as long as it exists in token_storage.
-    token_storage["yahoo_token"] = {
+    # as long as it exists.
+    mock_token = {
         "access_token": "mock_access_token",
         "token_type": "bearer",
-        "expires_in": 3600,
+        "expires_in": 3600, # 1 hour
+        "expires_at": time.time() + 3600,
         "refresh_token": "mock_refresh_token",
         "scope": "fspt-r",
     }
-    print("Successfully obtained MOCK Yahoo token.")
+    save_token(mock_token)
     # Redirect user back to the frontend dashboard
     return RedirectResponse(url="https://gregsfantasyhelper.solutions/")
 
 @app.get("/auth/status")
 async def auth_status():
     """Checks if the user is authenticated with Yahoo."""
-    return {"is_connected": "yahoo_token" in token_storage}
+    return {"is_connected": get_token() is not None}
 
 @app.get("/auth/logout")
 async def logout():
     """Logs the user out by clearing their session token."""
-    if "yahoo_token" in token_storage:
-        token_storage.pop("yahoo_token", None)
-        print("User logged out, token cleared")
+    # In a real file-based system, we might delete the file or just empty it.
+    # For now, we will simply remove the file.
+    import os
+    from app.auth import TOKEN_FILE
+    if os.path.exists(TOKEN_FILE):
+        os.remove(TOKEN_FILE)
+        print("User logged out, token file removed")
     return {"message": "Successfully logged out"}
 
 def _parse_yahoo_resource(resource_list):
@@ -510,7 +512,10 @@ async def get_dashboard():
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 # Token likely expired, clear it and force re-login
-                token_storage.pop("yahoo_token", None)
+                import os
+                from app.auth import TOKEN_FILE
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
                 raise HTTPException(status_code=401, detail="Yahoo token expired or invalid. Please re-authenticate.")
             print(f"Yahoo API Error: {e.response.text}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Error fetching data from Yahoo: {e.response.text}")
