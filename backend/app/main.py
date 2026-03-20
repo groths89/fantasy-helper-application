@@ -34,7 +34,8 @@ app.add_middleware(
     secret_key=os.getenv("SECRET_KEY", "a-very-secret-key-change-me"),
     https_only=True,
     same_site="none",
-    domain=".gregsfantasyhelper.solutions"
+    domain=".gregsfantasyhelper.solutions",
+    path="/"
 )
 
 # --- CORS Setup ---
@@ -411,11 +412,25 @@ def _parse_yahoo_resource(resource_list):
             data.update(item)
     return data
 
+TOKEN_PATH = "/app/automation/token.json"
+
 @app.get("/api/v1/dashboard")
-async def get_dashboard():
-    token = await get_valid_token()
+async def get_dashboard(request: Request):
+    # Try to get from session first
+    token = request.session.get("yahoo_token")
+    
+    # If session is empty, try to manually read the file from the volume
+    if not token and os.path.exists(TOKEN_PATH):
+        try:
+            with open(TOKEN_PATH, 'r') as f:
+                token = json.load(f)
+                # Sync it to the session so the next request is authorized
+                request.session["yahoo_token"] = token
+        except Exception as e:
+            print(f"Error reading token file: {e}")
+            
     if not token:
-        raise HTTPException(status_code=401, detail="Not connected to Yahoo. Please login.")
+        raise HTTPException(status_code=401, detail="No Yahoo Token found")
     
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token['access_token']}"},
