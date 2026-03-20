@@ -10,13 +10,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only the requirements first (optimizes Docker caching)
-COPY requirements.txt .
+COPY backend/requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of your backend code
-COPY . .
+# Copy the backend code
+COPY backend/app /app/app
+
+# Copy the automation scripts
+COPY automation /app/automation
 
 # Expose the port FastAPI runs on
 EXPOSE 8000
