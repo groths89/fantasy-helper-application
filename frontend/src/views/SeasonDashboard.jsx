@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { getDashboardData } from '../services/api';
 import MatchupCard from '../components/MatchupCard';
 import StrategyCenter from '../components/StrategyCenter';
