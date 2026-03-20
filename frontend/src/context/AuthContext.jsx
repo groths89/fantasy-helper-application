@@ -8,9 +8,15 @@ export const AuthProvider = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
+useEffect(() => {
     // Check auth status when the component mounts
-    fetch(`${API_BASE}/auth/status`)
+    fetch(`${API_BASE}/auth/status`, {
+      method: 'GET',
+      credentials: 'include', 
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
       .then(response => {
         if (!response.ok) {
           throw new Error('Network response was not ok');
@@ -27,7 +33,7 @@ export const AuthProvider = ({ children }) => {
       .finally(() => {
         setIsLoading(false);
       });
-  }, []);
+  }, [API_BASE]);
 
   const logout = async () => {
     try {
