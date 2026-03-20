@@ -429,15 +429,34 @@ async def get_dashboard(request: Request):
                 token = json.load(f)
                 # Sync it to the session so the next request is authorized
                 request.session["yahoo_token"] = token
-        except Exception as e:
-            print(f"Error reading token file: {e}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                print("DEBUG: Yahoo Token expired. Attempting refresh...")
+                try:
+                    # Import your refresh logic from the automation folder
+                    import sys
+                    sys.path.append('/automation')
+                    import yahoo_auth
+                    
+                    # This should update token.json automatically
+                    new_token = yahoo_auth.refresh_token() 
+                    
+                    if new_token:
+                        request.session["yahoo_token"] = new_token
+                        print("DEBUG: Token refreshed successfully. Please refresh the page.")
+                        # Optionally: you could recursively call get_dashboard(request) here
+                        # but a 401 with a 'token refreshed' message is safer for now.
+                except Exception as refresh_err:
+                    print(f"DEBUG: Refresh failed: {refresh_err}")
+                
+                raise HTTPException(status_code=401, detail="Yahoo session expired. Token refreshed, please try again.")
             
     if not token:
         print("DEBUG: No token found in session or on disk. Raising 401.")
         raise HTTPException(status_code=401, detail="No Yahoo Token found")
     
     print(f"DEBUG: Attempting Yahoo API call with token ending in ...{token.get('access_token', '')[-5:]}")
-    
+
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token['access_token']}"},
         params={"format": "json"}
