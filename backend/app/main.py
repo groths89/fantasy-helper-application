@@ -1,7 +1,6 @@
 import json
-from urllib import request
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -363,7 +362,7 @@ async def yahoo_mock_login():
     return RedirectResponse(url="https://gregsfantasyhelper.solutions/")
 
 @app.get("/auth/status")
-async def auth_status():
+async def auth_status(request: Request):
     """Checks if the user is authenticated with Yahoo."""
     # Check 1: Is it in the current session?
     if request.session.get("yahoo_token"):
