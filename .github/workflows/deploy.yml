@@ -24,7 +24,7 @@ jobs:
           docker push ghcr.io/${{ github.repository_owner }}/fantasy-helper-application-ui:latest
           
           # Build Backend
-          docker build \ 
+          docker build \
             -t ghcr.io/${{ github.repository_owner }}/fantasy-helper-application-api:latest \
             -f backend/Dockerfile .
           docker push ghcr.io/${{ github.repository_owner }}/fantasy-helper-application-api:latest
