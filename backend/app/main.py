@@ -7,6 +7,7 @@ import pandas as pd
 import os
 from io import StringIO
 import httpx
+import asyncio
 
 # Import from the apps logic
 from app.auth import yahoo_client, token_storage, get_valid_token
@@ -303,14 +304,19 @@ async def yahoo_login():
     """Redirects user to Yahoo for authentication."""
     authorization_url = await yahoo_client.get_authorization_url(
         scope="fspt-r",
-        redirect_uri=os.getenv("YAHOO_REDIRECT_URI"),
+        redirect_uri=YAHOO_REDIRECT_URI,
     )
     return RedirectResponse(authorization_url)
 
 @app.get("/auth/yahoo/callback")
-async def yahoo_callback(code: str):
+async def yahoo_callback(code: Optional[str] = None, error: Optional[str] = None):
     """Handles the callback from Yahoo after user authorization."""
-    token = await yahoo_client.get_access_token(code, redirect_uri=os.getenv("YAHOO_REDIRECT_URI"),)
+    if error:
+        raise HTTPException(status_code=400, detail=f"Error from Yahoo: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+
+    token = await yahoo_client.get_access_token(code, redirect_uri=YAHOO_REDIRECT_URI)
     # For simplicity, storing the token in memory.
     # In a real app, you'd associate this with a user session/ID and store it securely.
     token_storage["yahoo_token"] = token
