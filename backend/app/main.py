@@ -303,17 +303,29 @@ YAHOO_REDIRECT_URI = "https://api.gregsfantasyhelper.solutions/auth/yahoo/callba
 
 @app.get("/auth/yahoo")
 async def yahoo_login():
-    """Redirects user to Yahoo for authentication."""
-    authorization_url = await yahoo_client.get_authorization_url(
-        scope="openid fspt-r",
-        redirect_uri=YAHOO_REDIRECT_URI,
+    scope = "fspt-r" 
+    
+    authorization_url = (
+        f"https://api.login.yahoo.com/oauth2/request_auth"
+        f"?client_id={os.getenv('YAHOO_CLIENT_ID')}"
+        f"&redirect_uri=https://api.gregsfantasyhelper.solutions/auth/yahoo/callback"
+        f"&response_type=code"
+        f"&scope={scope}"
     )
     return RedirectResponse(authorization_url)
 
 @app.get("/auth/yahoo/callback")
-async def yahoo_callback(code: str): # FastAPI automatically grabs 'code' from the URL
+async def yahoo_callback(code: str = None, error: str = None):
+    # If Yahoo sent an error (like invalid_scope), catch it here!
+    if error:
+        return {
+            "status": "Yahoo Error",
+            "reason": error,
+            "solution": "Check if 'fspt-r' is the ONLY scope in your /auth/yahoo route."
+        }
+
     if not code:
-        raise HTTPException(status_code=400, detail="No code provided by Yahoo")
+        raise HTTPException(status_code=400, detail="No code or error received")
 
     # 1. Exchange the code for a token (Just like your script did)
     token = await yahoo_client.get_access_token(
