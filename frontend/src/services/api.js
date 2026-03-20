@@ -4,6 +4,7 @@ const API_BASE_URL = 'https://api.gregsfantasyhelper.solutions/api/v1';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
+  withCredentials: true,
   headers: {
     'Content-Type': 'application/json',
   },
