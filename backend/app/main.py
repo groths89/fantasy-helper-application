@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 from typing import List, Optional, Any, Dict
 import pandas as pd
 import os
@@ -27,6 +28,14 @@ router = APIRouter()
 
 app = FastAPI(title="Fantasy Baseball Helper API")
 app.include_router(router)
+
+app.add_middleware(
+    SessionMiddleware, 
+    secret_key=os.getenv("SECRET_KEY", "a-very-secret-key-change-me"),
+    https_only=True,
+    same_site="none",
+    domain=".gregsfantasyhelper.solutions"
+)
 
 # --- CORS Setup ---
 # Essential for React Frontend to talk to this API
