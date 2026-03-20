@@ -1,3 +1,5 @@
+import json
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -309,17 +311,23 @@ async def yahoo_login():
     return RedirectResponse(authorization_url)
 
 @app.get("/auth/yahoo/callback")
-async def yahoo_callback(code: Optional[str] = None, error: Optional[str] = None):
-    """Handles the callback from Yahoo after user authorization."""
-    if error:
-        raise HTTPException(status_code=400, detail=f"Error from Yahoo: {error}")
+async def yahoo_callback(code: str): # FastAPI automatically grabs 'code' from the URL
     if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code")
+        raise HTTPException(status_code=400, detail="No code provided by Yahoo")
 
-    token = await yahoo_client.get_access_token(code, redirect_uri=YAHOO_REDIRECT_URI)
-    save_token(token)
-    # Redirect user back to the dashboard
-    return RedirectResponse(url="https://gregsfantasyhelper.solutions/")
+    # 1. Exchange the code for a token (Just like your script did)
+    token = await yahoo_client.get_access_token(
+        code=code, 
+        redirect_uri=YAHOO_REDIRECT_URI # Must match what you sent in /auth/yahoo
+    )
+
+    # 2. Save it so the Daily Bot can see it
+    with open("automation/token.json", "w") as f:
+        json.dump(token, f)
+
+    # 3. Tell React the user is logged in
+    # Redirect back to your frontend dashboard
+    return RedirectResponse(url="https://gregsfantasyhelper.solutions/dashboard?login=success")
 
 # NOTE: This is for development and testing only.
 # It allows the UI to be tested without a real Yahoo login.
