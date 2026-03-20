@@ -416,11 +416,13 @@ TOKEN_PATH = "/app/automation/token.json"
 
 @app.get("/api/v1/dashboard")
 async def get_dashboard(request: Request):
+    import os as _os
+
     # Try to get from session first
     token = request.session.get("yahoo_token")
     
     # If session is empty, try to manually read the file from the volume
-    if not token and os.path.exists(TOKEN_PATH):
+    if not token and _os.path.exists(TOKEN_PATH):
         try:
             with open(TOKEN_PATH, 'r') as f:
                 token = json.load(f)
