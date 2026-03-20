@@ -10,6 +10,14 @@ const SeasonDashboard = () => {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  useEffect(() => {
+    if (location.search.includes('login=success')) {
+      navigate('/dashboard', { replace: true });
+    }
+  }, [location, navigate]);
 
   useEffect(() => {
     const fetchData = async () => {

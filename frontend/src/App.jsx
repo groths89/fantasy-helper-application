@@ -24,6 +24,7 @@ function App() {
       <Navbar />
       <Routes>
         <Route path="/" element={isConnected ? <SeasonDashboard /> : <HomePage />} /> {/* Home page is conditional */}
+        <Route path="/dashboard" element={isConnected ? <SeasonDashboard /> : <Navigate to="/" replace />} /> {/* Protected route */}
         <Route path="/draft" element={isConnected ? <DraftRoom /> : <Navigate to="/" replace />} /> {/* Protected route */}
         <Route path="/settings" element={isConnected ? <Settings /> : <Navigate to="/" replace />} /> {/* Protected route */}
       </Routes>
