@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY ./backend/app /app/app
 
 # Copy the automation scripts
-COPY ./automation /app/automation
+COPY ../automation /app/automation
 
 # Expose the port FastAPI runs on
 EXPOSE 8000
