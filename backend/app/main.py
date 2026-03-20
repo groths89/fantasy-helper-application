@@ -1,4 +1,5 @@
 import json
+from urllib import request
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -364,7 +365,17 @@ async def yahoo_mock_login():
 @app.get("/auth/status")
 async def auth_status():
     """Checks if the user is authenticated with Yahoo."""
-    return {"is_connected": get_token() is not None}
+    # Check 1: Is it in the current session?
+    if request.session.get("yahoo_token"):
+        return {"is_connected": True}
+    
+    # Check 2: Does the file exist on the server?
+    token_path = "/app/automation/token.json"
+    if os.path.exists(token_path):
+        # Optional: You could even validate the token here
+        return {"is_connected": True}
+        
+    return {"is_connected": False}
 
 @app.get("/auth/logout")
 async def logout():
