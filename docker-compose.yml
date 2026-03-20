@@ -4,8 +4,6 @@ services:
     # Build on GitHub, Pull on Lightsail
     image: ghcr.io/groths89/fantasy-helper-application-api:latest
     container_name: fantasy_helper_app_api
-    context: .
-    dockerfile: backend/Dockerfile
     volumes:
       - ./data:/app/data
       - ./bot_logs.jsonl:/app/bot_logs.jsonl
