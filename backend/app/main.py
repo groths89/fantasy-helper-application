@@ -412,7 +412,7 @@ def _parse_yahoo_resource(resource_list):
             data.update(item)
     return data
 
-TOKEN_PATH = "/app/automation/token.json"
+TOKEN_PATH = "/automation/token.json"
 
 @app.get("/api/v1/dashboard")
 async def get_dashboard(request: Request):
@@ -424,6 +424,7 @@ async def get_dashboard(request: Request):
     # If session is empty, try to manually read the file from the volume
     if not token and _os.path.exists(TOKEN_PATH):
         try:
+            print("DEBUG: Token file found on disk. Loading...")
             with open(TOKEN_PATH, 'r') as f:
                 token = json.load(f)
                 # Sync it to the session so the next request is authorized
@@ -432,7 +433,10 @@ async def get_dashboard(request: Request):
             print(f"Error reading token file: {e}")
             
     if not token:
+        print("DEBUG: No token found in session or on disk. Raising 401.")
         raise HTTPException(status_code=401, detail="No Yahoo Token found")
+    
+    print(f"DEBUG: Attempting Yahoo API call with token ending in ...{token.get('access_token', '')[-5:]}")
     
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token['access_token']}"},
