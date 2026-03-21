@@ -1,6 +1,8 @@
 import axios from 'axios';
 
-const API_BASE_URL = 'https://api.gregsfantasyhelper.solutions/api/v1';
+const API_BASE_URL = window.location.hostname === 'localhost' 
+  ? 'http://localhost:8000/api/v1' 
+  : 'https://api.gregsfantasyhelper.solutions/api/v1';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -87,5 +89,35 @@ export const getDashboardData = async () => {
   } catch (error) {
     console.error('Error fetching dashboard data:', error);
     throw error;
+  }
+};
+
+export const getLeagueTransactions = async (count = 50, offset = 0) => {
+  try {
+    const response = await apiClient.get('/league/transactions', { params: { count, offset } });
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching transactions:', error);
+    throw error;
+  }
+};
+
+export const getMatchupDetails = async () => {
+  try {
+    const response = await apiClient.get('/matchup/details');
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching matchup details:', error);
+    throw error;
+  }
+};
+
+export const getMLBScores = async () => {
+  try {
+    const response = await apiClient.get('/mlb/scores');
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching MLB scores:', error);
+    return [];
   }
 };

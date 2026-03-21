@@ -1,4 +1,6 @@
 import json
+import time
+import datetime
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +13,10 @@ import os
 from io import StringIO
 import httpx
 import asyncio
+import urllib.parse
 
 # Import from the apps logic
-from app.auth import yahoo_client, save_token, get_token, get_valid_token
+from app.auth import yahoo_client, save_token, get_token, get_valid_token, TOKEN_FILE
 from app.engine.sgp import engine
 from app.engine.projections import fetch_2026_projections
 from app.engine.statcast import get_anti_tilt_metrics
@@ -27,14 +30,15 @@ points_engine = PointsEngine()
 router = APIRouter()
 
 app = FastAPI(title="Fantasy Baseball Helper API")
-app.include_router(router)
+
+is_prod = os.getenv("ENVIRONMENT") == "production"
 
 app.add_middleware(
     SessionMiddleware, 
     secret_key=os.getenv("SECRET_KEY", "a-very-secret-key-change-me"),
-    https_only=True,
-    same_site="none",
-    domain=".gregsfantasyhelper.solutions",
+    https_only=is_prod,
+    same_site="none" if is_prod else "lax",
+    domain=".gregsfantasyhelper.solutions" if is_prod else None,
     path="/"
 )
 
@@ -100,6 +104,29 @@ class RecommendationRequest(BaseModel):
     players: List[PlayerRank] # The full ranked list from the frontend
     all_taken_players: List[PlayerRank]
 
+# Yahoo Stat IDs mapping for standard 5x5 categories
+STAT_ID_MAP = {
+    '7': 'R', '12': 'HR', '13': 'RBI', '16': 'SB', '3': 'AVG',
+    '28': 'W', '32': 'SV', '42': 'K', '26': 'ERA', '27': 'WHIP'
+}
+INVERSE_STATS = {'26', '27'} # Lower is better for ERA and WHIP
+
+def calculate_weekly_projection(roster_names: List[str], projections_df: pd.DataFrame) -> float:
+    """Estimates remaining weekly points based on season projections."""
+    if not roster_names or projections_df.empty:
+        return 0.0
+    
+    # Filter projections for players in the roster
+    team_df = projections_df[projections_df['name'].isin(roster_names)].copy()
+    
+    # Simple H2H Points Approximation (Season Total)
+    # Note: In a real app, this should reuse the logic from get_rankings or points_engine
+    # Here we use a simplified approximation for the dashboard signal
+    # Assuming 'PTS' column exists or calculating roughly from 5x5
+    # Re-using the logic from get_rankings would be ideal but for brevity we approximate:
+    # (This assumes standard scoring roughly aligns with SGP-weighted-like magnitude or just uses raw sums if available)
+    # For better accuracy, we re-implement the points calc briefly:
+    return points_engine.calculate_team_season_points(team_df)
 
 # --- Endpoints ---
 @router.get("/bot/logs", response_model=List[Dict[str, Any]], tags=["bot"])
@@ -124,6 +151,32 @@ async def run_bot_manually():
         return {"status": "Automation started", "pid": process.pid}
     except Exception as e:
         return {"status": "Error", "message": str(e)}
+        
+def _calculate_dataframe_points(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates H2H points for a dataframe of players."""
+    def calculate_points(row):
+        points = 0
+        # Pitching
+        if row.get('IP', 0) > 0:
+            pitching_points = 0
+            pitching_points += row.get('IP', 0) * 3
+            pitching_points += row.get('SO', 0) * 1
+            pitching_points += row.get('W', 0) * 7
+            pitching_points += row.get('L', 0) * -5
+            pitching_points += row.get('SV', 0) * 7
+            pitching_points += row.get('HLD', 0) * 5
+            pitching_points += row.get('ER', 0) * -2
+            pitching_points += row.get('H_allowed', 0) * -1
+            pitching_points += row.get('BB_allowed', 0) * -1
+            points += pitching_points
+        # Hitting (uses PointsEngine for complex hitter logic if available, or simple here)
+        if row.get('AB', 0) > 0:
+            points += points_engine.calculate_hitter_points(row)
+        return points
+
+    if not df.empty:
+        df['total_points'] = df.apply(calculate_points, axis=1)
+    return df
 
 @app.get("/")
 async def root():
@@ -169,27 +222,7 @@ async def get_rankings(scoring: str = 'h2h', skip: int = 0, limit: int = 5000):
     
     if scoring == 'h2h':
         # Calculate Total Points first
-        def calculate_points(row):
-            points = 0
-            # If player has pitching stats (IP > 0), calculate pitching points
-            if row.get('IP', 0) > 0: # Assuming IP > 0 means they are a pitcher
-                pitching_points = 0
-                pitching_points += row.get('IP', 0) * 3
-                pitching_points += row.get('SO', 0) * 1
-                pitching_points += row.get('W', 0) * 7
-                pitching_points += row.get('L', 0) * -5
-                pitching_points += row.get('SV', 0) * 7
-                pitching_points += row.get('HLD', 0) * 5
-                pitching_points += row.get('ER', 0) * -2
-                pitching_points += row.get('H_allowed', 0) * -1
-                pitching_points += row.get('BB_allowed', 0) * -1
-                points += pitching_points
-            # If player has hitting stats (AB > 0), calculate hitting points
-            if row.get('AB', 0) > 0:
-                points += points_engine.calculate_hitter_points(row)
-            return points
-
-        df['total_points'] = df.apply(calculate_points, axis=1)
+        df = _calculate_dataframe_points(df)
         
         # Then calculate VORP (Value Over Replacement)
         df['vorp'] = df.apply(
@@ -309,23 +342,25 @@ async def get_player_anti_tilt(player_id: int):
     raise HTTPException(status_code=404, detail="Player not found")
   return metrics
 
-YAHOO_REDIRECT_URI = "https://api.gregsfantasyhelper.solutions/auth/yahoo/callback"
+default_redirect_uri = "https://api.gregsfantasyhelper.solutions/auth/yahoo/callback" if is_prod else "http://localhost:8000/auth/yahoo/callback"
+YAHOO_REDIRECT_URI = os.getenv("YAHOO_REDIRECT_URI", default_redirect_uri)
 
 @app.get("/auth/yahoo")
 async def yahoo_login():
     scope = "fspt-r" 
+    encoded_redirect_uri = urllib.parse.quote(YAHOO_REDIRECT_URI)
     
     authorization_url = (
         f"https://api.login.yahoo.com/oauth2/request_auth"
         f"?client_id={os.getenv('YAHOO_CLIENT_ID')}"
-        f"&redirect_uri=https://api.gregsfantasyhelper.solutions/auth/yahoo/callback"
+        f"&redirect_uri={encoded_redirect_uri}"
         f"&response_type=code"
         f"&scope={scope}"
     )
     return RedirectResponse(authorization_url)
 
 @app.get("/auth/yahoo/callback")
-async def yahoo_callback(code: str = None, error: str = None):
+async def yahoo_callback(request: Request, code: str = None, error: str = None):
     # If Yahoo sent an error (like invalid_scope), catch it here!
     if error:
         return {
@@ -344,18 +379,22 @@ async def yahoo_callback(code: str = None, error: str = None):
     )
 
     # 2. Save it so the Daily Bot can see it
-    with open("automation/token.json", "w") as f:
-        json.dump(token, f)
+    save_token(token)
 
-    # 3. Tell React the user is logged in
+    # 3. Create session for the frontend
+    request.session["yahoo_token"] = token
+
+    # 4. Tell React the user is logged in
     # Redirect back to your frontend dashboard
-    return RedirectResponse(url="https://gregsfantasyhelper.solutions/dashboard?login=success")
+    default_frontend_url = "https://gregsfantasyhelper.solutions" if is_prod else "http://localhost:5173"
+    frontend_url = os.getenv("FRONTEND_URL", default_frontend_url)
+    return RedirectResponse(url=f"{frontend_url}/dashboard?login=success")
 
 # NOTE: This is for development and testing only.
 # It allows the UI to be tested without a real Yahoo login.
 # In a production environment, this endpoint should be disabled.
 @app.get("/auth/yahoo/mock")
-async def yahoo_mock_login():
+async def yahoo_mock_login(request: Request):
     """Mocks a Yahoo login for development."""
     # Create a fake token. The content doesn't matter much for the UI,
     # as long as it exists.
@@ -368,34 +407,50 @@ async def yahoo_mock_login():
         "scope": "fspt-r",
     }
     save_token(mock_token)
+        
+    request.session["yahoo_token"] = mock_token
+    
     # Redirect user back to the frontend dashboard
-    return RedirectResponse(url="https://gregsfantasyhelper.solutions/")
+    default_frontend_url = "https://gregsfantasyhelper.solutions" if is_prod else "http://localhost:5173"
+    frontend_url = os.getenv("FRONTEND_URL", default_frontend_url)
+    return RedirectResponse(url=f"{frontend_url}/")
 
 @app.get("/auth/status")
 async def auth_status(request: Request):
-    """Checks if the user is authenticated with Yahoo."""
+    """Checks if the user is authenticated with Yahoo via session or valid token file."""
     # Check 1: Is it in the current session?
     if request.session.get("yahoo_token"):
         return {"is_connected": True}
     
     # Check 2: Does the file exist on the server?
-    token_path = "/app/automation/token.json"
-    if os.path.exists(token_path):
-        # Optional: You could even validate the token here
-        return {"is_connected": True}
+    possible_paths = ["../automation/token.json", "automation/token.json", "/app/automation/token.json"]
+    for path in possible_paths:
+        if os.path.exists(path):
+            # Optional: You could even validate the token here
+            return {"is_connected": True}
         
     return {"is_connected": False}
 
 @app.get("/auth/logout")
-async def logout():
+async def logout(request: Request):
     """Logs the user out by clearing their session token."""
+    # Clear session
+    request.session.clear()
+
     # In a real file-based system, we might delete the file or just empty it.
-    # For now, we will simply remove the file.
-    import os
-    from app.auth import TOKEN_FILE
-    if os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
-        print("User logged out, token file removed")
+    # For now, we will remove files from all possible paths to be safe.
+    possible_paths = ["../automation/token.json", "automation/token.json", "/app/automation/token.json"]
+    if TOKEN_FILE not in possible_paths:
+        possible_paths.append(TOKEN_FILE)
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                print(f"User logged out, token file removed: {path}")
+            except Exception:
+                pass
+                
     return {"message": "Successfully logged out"}
 
 def _parse_yahoo_resource(resource_list):
@@ -411,6 +466,84 @@ def _parse_yahoo_resource(resource_list):
         if isinstance(item, dict):
             data.update(item)
     return data
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+def _calculate_win_probability(my_score, opp_score, my_proj_remaining, opp_proj_remaining):
+    """
+    Calculates win probability using a logistic function on the projected final spread.
+    """
+    my_final = my_score + my_proj_remaining
+    opp_final = opp_score + opp_proj_remaining
+    spread = my_final - opp_final
+    
+    # Logistic function: 1 / (1 + 10^(-spread/K))
+    # K determines the steepness. 
+    # A spread of 50 points in fantasy baseball is significant but not insurmountable early in the week.
+    # As the week progresses, variance decreases (not modeled here for simplicity).
+    k = 40 
+    prob = 1 / (1 + 10 ** (-spread / k))
+    
+    return prob * 100, my_final, opp_final
+
+def _parse_transactions(t_data):
+    """Helper to parse Yahoo transaction JSON into a clean list."""
+    transactions = []
+    if isinstance(t_data, dict) and 'count' in t_data:
+        for i in range(safe_int(t_data['count'])):
+            if str(i) not in t_data: continue
+            
+            # Yahoo transaction structure is usually: [metadata_dict, {players_dict}]
+            t_item = t_data[str(i)]
+            t_meta = {}
+            t_players_node = {}
+            
+            if isinstance(t_item, list):
+                t_meta = t_item[0]
+                if len(t_item) > 1:
+                    t_players_node = t_item[1]
+            else:
+                t_meta = t_item # Fallback
+
+            # Parse info
+            ts = float(t_meta.get('timestamp', 0))
+            time_formatted = datetime.datetime.fromtimestamp(ts).strftime("%b %d, %I:%M %p")
+            action_type = t_meta.get('type', 'transaction')
+            
+            players_desc = []
+            primary_team = "League"
+
+            if 'players' in t_players_node:
+                p_wrapper = t_players_node['players']
+                for p_i in range(safe_int(p_wrapper.get('count', 0))):
+                    if str(p_i) in p_wrapper:
+                        p_obj = p_wrapper[str(p_i)]['player']
+                        # p_obj is typically [[meta], {trans_info}]
+                        if isinstance(p_obj, list) and len(p_obj) > 0:
+                            p_meta = _parse_yahoo_resource(p_obj[0])
+                            p_name = p_meta.get('name', {}).get('full', 'Unknown')
+                            players_desc.append(p_name)
+                            
+                            if len(p_obj) > 1:
+                                p_trans = _parse_yahoo_resource(p_obj[1])
+                                if primary_team == "League":
+                                    if 'destination_team_name' in p_trans:
+                                        primary_team = p_trans['destination_team_name']
+                                    elif 'source_team_name' in p_trans:
+                                        primary_team = p_trans['source_team_name']
+            
+            transactions.append({
+                "id": t_meta.get('transaction_key', f"tx_{i}"),
+                "time": time_formatted,
+                "team": primary_team,
+                "action": action_type,
+                "details": ", ".join(players_desc) or "No details"
+            })
+    return transactions
 
 @app.get("/api/v1/dashboard")
 async def get_dashboard(
@@ -431,9 +564,14 @@ async def get_dashboard(
     # Sync valid token to session
     request.session["yahoo_token"] = token
     
+    # If we're using the mock token, return the mock dashboard data
+    if token.get("access_token") == "mock_access_token":
+        print("DEBUG: Using mock access token. Returning mock dashboard data.")
+        return await get_dashboard_mock()
+
     print(f"DEBUG: Attempting Yahoo API call with token ending in ...{token.get('access_token', '')[-5:]}")
 
-    async with httpx.AsyncClient(
+    async with httpx.AsyncClient(timeout=10.0,
         headers={"Authorization": f"Bearer {token['access_token']}"},
         params={"format": "json"}
     ) as client:
@@ -457,8 +595,15 @@ async def get_dashboard(
                 mlb_game = None
                 # Yahoo returns 'count' and then keys '0', '1', etc.
                 count = games.get('count', 0)
-                for i in range(count):
-                    game_data = games[str(i)]['game'][0]
+                for i in range(safe_int(count)):
+                    game_obj = games[str(i)]['game']
+                    if isinstance(game_obj, list):
+                        game_data = game_obj[0]
+                    elif isinstance(game_obj, dict) and '0' in game_obj:
+                        game_data = game_obj['0']
+                    else:
+                        game_data = game_obj
+                        
                     if game_data.get('code') == 'mlb' and game_data.get('season') == '2026':
                         mlb_game = game_data
                         break
@@ -474,14 +619,14 @@ async def get_dashboard(
                 
                 team_list_raw = res.json()['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']
                 
-                if team_list_raw.get('count', 0) == 0:
+                if safe_int(team_list_raw.get('count', 0)) == 0:
                     raise HTTPException(status_code=404, detail="No teams found in the 2026 season.")
 
                 # Default to the first team found
                 my_team_raw = team_list_raw['0']['team'][0]
                 my_team = _parse_yahoo_resource(my_team_raw)
                 my_team_key = my_team['team_key']
-                my_league_key = my_team['league_key']
+                my_league_key = my_team.get('league_key')
             
             # If we have a team key but no league key (passed via param), derive it
             if not my_league_key and my_team_key:
@@ -491,72 +636,358 @@ async def get_dashboard(
                 if len(parts) > 0:
                     my_league_key = parts[0]
 
+            # 2.5 Fetch League Settings for Dynamic Categories
+            active_stat_map = STAT_ID_MAP.copy()
+            active_inverse_stats = INVERSE_STATS.copy()
+
+            try:
+                settings_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/settings"
+                res_settings = await client.get(settings_url)
+                if res_settings.status_code == 200:
+                    l_data = res_settings.json()['fantasy_content']['league']
+                    # League response is a list: [ {metadata}, {settings: ...} ]
+                    if isinstance(l_data, list) and len(l_data) > 1:
+                        settings_node = l_data[1].get('settings', [])
+                        if isinstance(settings_node, list) and len(settings_node) > 0:
+                            stats_node = settings_node[0].get('stat_categories', {}).get('stats', [])
+                            
+                            dynamic_map = {}
+                            dynamic_inverse = set()
+                            
+                            for item in stats_node:
+                                stat = item.get('stat')
+                                if not stat: continue
+                                # 'enabled' is usually '1' for active stats
+                                if stat.get('enabled') == '1':
+                                    s_id = str(stat['stat_id'])
+                                    s_disp = stat.get('display_name', 'UNK')
+                                    dynamic_map[s_id] = s_disp
+                                    
+                                    # sort_order: 0 = Ascending (Lower is better), 1 = Descending (Higher is better)
+                                    if str(stat.get('sort_order')) == '0':
+                                        dynamic_inverse.add(s_id)
+                            
+                            if dynamic_map:
+                                active_stat_map = dynamic_map
+                                active_inverse_stats = dynamic_inverse
+            except Exception as e:
+                print(f"Warning: Failed to fetch league settings, using defaults. Error: {e}")
+
             # 3. Get Standings
             standings_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/standings"
             res = await client.get(standings_url)
             res.raise_for_status()
             teams_raw = res.json()['fantasy_content']['league'][1]['standings'][0]['teams']
 
+            # Data structures for Radar Chart calculation
+            category_values = {k: [] for k in active_stat_map.keys()}
+            my_team_stats_raw = {}
+
             standings = []
-            for i in range(teams_raw['count']):
-                team_data_raw = teams_raw[str(i)]['team'][0]
-                team_data = _parse_yahoo_resource(team_data_raw)
-                outcome = team_data['team_standings']['outcome_totals']
-                record = f"{outcome['wins']}-{outcome['losses']}-{outcome['ties']}"
-                standings.append({
-                    "rank": int(team_data['team_standings']['rank']),
-                    "name": team_data['name'],
-                    "record": record,
-                    "highlight": team_data['team_key'] == my_team_key
-                })
+            for i in range(safe_int(teams_raw.get('count', 0))):
+                # Yahoo structure is [ [meta, meta], {standings}, ... ]
+                team_wrapper = teams_raw[str(i)]['team']
+                team_data = {}
+                
+                # 1. Parse metadata (index 0 is a list)
+                if isinstance(team_wrapper, list) and len(team_wrapper) > 0 and isinstance(team_wrapper[0], list):
+                    team_data.update(_parse_yahoo_resource(team_wrapper[0]))
+
+                # 2. Parse the rest (dictionaries)
+                if isinstance(team_wrapper, list):
+                    for item in team_wrapper:
+                        if isinstance(item, dict):
+                            team_data.update(item)
+                
+                # Extract Stats for Radar Chart
+                if 'team_stats' in team_data and 'stats' in team_data['team_stats']:
+                    t_stats = team_data['team_stats']['stats']
+                    for stat_item in t_stats:
+                        stat = stat_item.get('stat', {})
+                        s_id = str(stat.get('stat_id'))
+                        s_val = stat.get('value')
+                        if s_id in active_stat_map:
+                            try:
+                                val = float(s_val) if s_val and s_val != '-' else 0.0
+                                category_values[s_id].append(val)
+                                if team_data.get('team_key') == my_team_key:
+                                    my_team_stats_raw[s_id] = val
+                            except (ValueError, TypeError):
+                                pass
+                
+                if 'team_standings' in team_data:
+                    t_standings = team_data['team_standings']
+                    if 'outcome_totals' in t_standings:
+                        outcome = t_standings['outcome_totals']
+                        record = f"{outcome['wins']}-{outcome['losses']}-{outcome['ties']}"
+                    else:
+                        record = f"Pts: {t_standings.get('points_for', 0)}"
+                        
+                    standings.append({
+                        "rank": safe_int(t_standings.get('rank', 0)),
+                        "name": team_data.get('name', 'Unknown'),
+                        "record": record,
+                        "highlight": team_data.get('team_key') == my_team_key
+                    })
+
+            # Process Radar Data (Normalize to 0-100 scale)
+            radar_data = []
+            if my_team_stats_raw and any(len(v) > 0 for v in category_values.values()):
+                for s_id, label in active_stat_map.items():
+                    values = category_values[s_id]
+                    if not values: continue
+                    
+                    my_val = my_team_stats_raw.get(s_id, 0.0)
+                    avg_val = sum(values) / len(values)
+                    max_val = max(values)
+                    min_val = min(values)
+                    
+                    rng = max_val - min_val
+                    if rng == 0: rng = 1 # Prevent division by zero
+                    
+                    if s_id in active_inverse_stats:
+                        # Lower is better (e.g. ERA)
+                        # Score = (Worst - My) / (Worst - Best) * 100
+                        # Worst is max_val, Best is min_val
+                        my_score = ((max_val - my_val) / rng) * 100
+                        avg_score = ((max_val - avg_val) / rng) * 100
+                    else:
+                        # Higher is better
+                        my_score = ((my_val - min_val) / rng) * 100
+                        avg_score = ((avg_val - min_val) / rng) * 100
+                        
+                    radar_data.append({
+                        "subject": label,
+                        "My Team": int(max(0, min(100, my_score))),
+                        "League Avg": int(max(0, min(100, avg_score))),
+                        "myRaw": my_val,
+                        "avgRaw": avg_val,
+                        "fullMark": 100
+                    })
 
             # 4. Get Matchup
             matchup_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_team_key}/matchups"
             res = await client.get(matchup_url)
             res.raise_for_status()
-            matchup_data = res.json()['fantasy_content']['team'][1]['matchups']['0']['matchup']
             
-            teams_in_matchup = matchup_data['0']['teams']
-            team1_data = _parse_yahoo_resource(teams_in_matchup['0']['team'][0])
-            team2_data = _parse_yahoo_resource(teams_in_matchup['1']['team'][0])
-
-            my_matchup_team, opponent_matchup_team = (team1_data, team2_data) if team1_data['team_key'] == my_team_key else (team2_data, team1_data)
-
-            my_score = float(_parse_yahoo_resource(my_matchup_team['team_points'])['total'])
-            opponent_score = float(_parse_yahoo_resource(opponent_matchup_team['team_points'])['total'])
+            team_wrapper = res.json()['fantasy_content']['team'][1]
+            # Safely get matchups container
+            matchups_wrapper = team_wrapper.get('matchups', {})
             
-            my_team_record_raw = my_matchup_team['team_standings']['outcome_totals']
-            my_team_record = f"{my_team_record_raw['wins']}-{my_team_record_raw['losses']}-{my_team_record_raw['ties']}"
-            opponent_record_raw = opponent_matchup_team['team_standings']['outcome_totals']
-            opponent_record = f"{opponent_record_raw['wins']}-{opponent_record_raw['losses']}-{opponent_record_raw['ties']}"
+            my_matchup_team = {}
+            matchup = None
+            
+            # Check if there are actual matchups to parse (count > 0 and '0' key exists)
+            if isinstance(matchups_wrapper, dict) and matchups_wrapper.get('count', 0) > 0 and '0' in matchups_wrapper:
+                matchup_data = matchups_wrapper['0']['matchup']
+                
+                teams_in_matchup = matchup_data['0']['teams']
+                
+                # Helper to parse full team structure which is a list: [ [meta], {data}, ... ]
+                def _extract_full_matchup_team_data(team_wrapper):
+                    data = {}
+                    if isinstance(team_wrapper, list):
+                        # Index 0 is usually the metadata list
+                        if len(team_wrapper) > 0 and isinstance(team_wrapper[0], list):
+                            data.update(_parse_yahoo_resource(team_wrapper[0]))
+                        
+                        # The rest are dicts (team_standings, team_points, etc.)
+                        for item in team_wrapper:
+                            if isinstance(item, dict):
+                                data.update(item)
+                    return data
 
-            matchup = {
-                "team_name": my_matchup_team['name'],
-                "team_owner": _parse_yahoo_resource(my_matchup_team['managers'][0]['manager'])['nickname'],
-                "team_record": my_team_record,
-                "team_score": my_score,
-                "opponent_name": opponent_matchup_team['name'],
-                "opponent_owner": _parse_yahoo_resource(opponent_matchup_team['managers'][0]['manager'])['nickname'],
-                "opponent_record": opponent_record,
-                "opponent_score": opponent_score,
-                "winning": my_score > opponent_score
-            }
+                team1_data = _extract_full_matchup_team_data(teams_in_matchup['0']['team'])
+                team2_data = _extract_full_matchup_team_data(teams_in_matchup['1']['team'])
+
+                my_matchup_team, opponent_matchup_team = (team1_data, team2_data) if team1_data.get('team_key') == my_team_key else (team2_data, team1_data)
+
+                my_score = float(_parse_yahoo_resource(my_matchup_team.get('team_points', {'total': 0})).get('total', 0))
+                opponent_score = float(_parse_yahoo_resource(opponent_matchup_team.get('team_points', {'total': 0})).get('total', 0))
+                
+                def _get_record_safe(team_d):
+                    standings = team_d.get('team_standings', {})
+                    if 'outcome_totals' in standings:
+                        o = standings['outcome_totals']
+                        return f"{o.get('wins',0)}-{o.get('losses',0)}-{o.get('ties',0)}"
+                    # Fallback if no W-L-T (e.g. points league or pre-season)
+                    return f"Rank: {standings.get('rank', '-')}"
+
+                my_team_record = _get_record_safe(my_matchup_team)
+                opponent_record = _get_record_safe(opponent_matchup_team)
+                
+                # Determine winning boolean safely
+                is_winning = my_score > opponent_score
+                
+                def _get_logo(team_d):
+                    logos = team_d.get('team_logos', [])
+                    if isinstance(logos, list) and len(logos) > 0:
+                        return logos[0].get('team_logo', {}).get('url')
+                    return None
+
+                matchup = {
+                    "team_name": my_matchup_team.get('name', 'My Team'),
+                    "team_logo": _get_logo(my_matchup_team),
+                    "team_owner": _parse_yahoo_resource(my_matchup_team.get('managers', [{'manager': {'nickname': 'Me'}}])[0]['manager'])['nickname'],
+                    "team_record": my_team_record,
+                    "team_score": my_score,
+                    "opponent_name": opponent_matchup_team.get('name', 'Opponent'),
+                    "opponent_logo": _get_logo(opponent_matchup_team),
+                    "opponent_owner": _parse_yahoo_resource(opponent_matchup_team.get('managers', [{'manager': {'nickname': 'Opponent'}}])[0]['manager'])['nickname'],
+                    "opponent_record": opponent_record,
+                    "opponent_score": opponent_score,
+                    "winning": is_winning,
+                    "team_key": my_matchup_team.get('team_key'),
+                    "opponent_team_key": opponent_matchup_team.get('team_key')
+                }
+            else:
+                # Fallback if no matchup found (Pre-season, Bye week, or API issue)
+                matchup = {
+                    "team_name": "No Matchup",
+                    "team_owner": "N/A",
+                    "team_record": "0-0-0",
+                    "team_score": 0,
+                    "opponent_name": "N/A",
+                    "opponent_owner": "N/A",
+                    "opponent_record": "0-0-0",
+                    "opponent_score": 0,
+                    "winning": True,
+                    "team_key": None,
+                    "opponent_team_key": None
+                }
 
             # 5. Get Roster to generate recommendations
             roster_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_team_key}/roster"
             res = await client.get(roster_url)
             res.raise_for_status()
-            roster_raw = res.json()['fantasy_content']['team'][1]['roster']['0']['players']
+            
+            # Yahoo returns a list [] when empty, but a dict {...} when populated.
+            # We must handle both cases safely.
+            team_data = res.json()['fantasy_content']['team'][1]
+            roster_raw = team_data.get('roster', {}).get('0', {}).get('players', {})
 
             my_roster_player_names = []
-            for i in range(roster_raw['count']):
-                player_data_raw = roster_raw[str(i)]['player'][0]
-                player_data = _parse_yahoo_resource(player_data_raw)
-                my_roster_player_names.append(player_data['name']['full'])
+            
+            if isinstance(roster_raw, dict) and 'count' in roster_raw:
+                for i in range(safe_int(roster_raw['count'])):
+                    if str(i) in roster_raw:
+                        player_data_raw = roster_raw[str(i)]['player'][0]
+                        player_data = _parse_yahoo_resource(player_data_raw)
+                        my_roster_player_names.append(player_data['name']['full'])
+
+            # 5b. Get Opponent Roster & Calculate Win Probability
+            win_probability = 50.0
+            if matchup['opponent_team_key']:
+                try:
+                    opp_roster_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{matchup['opponent_team_key']}/roster"
+                    res_opp = await client.get(opp_roster_url)
+                    opp_roster_names = []
+                    if res_opp.status_code == 200:
+                        opp_r_data = res_opp.json()['fantasy_content']['team'][1].get('roster', {}).get('0', {}).get('players', {})
+                        if isinstance(opp_r_data, dict) and 'count' in opp_r_data:
+                            for i in range(safe_int(opp_r_data['count'])):
+                                if str(i) in opp_r_data:
+                                    p = _parse_yahoo_resource(opp_r_data[str(i)]['player'][0])
+                                    opp_roster_names.append(p['name']['full'])
+                    
+                    if my_roster_player_names and opp_roster_names:
+                        projections = fetch_2026_projections()
+                        
+                        # Calculate "Rest of Week" factor
+                        # 0 = Monday, 6 = Sunday. 
+                        # Remaining days = 7 - current_day_index (roughly)
+                        # If today is Monday (0), 7 days remain. If Sunday (6), 1 day remains.
+                        # We normalize by 26 weeks in a season.
+                        current_day = datetime.datetime.now().weekday()
+                        days_remaining = 7 - current_day
+                        # Factor = (Season_Points / 26 weeks) * (Days_Remaining / 7 days)
+                        #        = Season_Points * (Days_Remaining / 182)
+                        time_factor = days_remaining / 182.0
+                        
+                        def _get_season_points(names):
+                            rows = projections[projections['name'].isin(names)]
+                            rows = _calculate_dataframe_points(rows)
+                            return rows['total_points'].sum()
+
+                        my_rem = _get_season_points(my_roster_player_names) * time_factor
+                        opp_rem = _get_season_points(opp_roster_names) * time_factor
+                        
+                        win_probability, _, _ = _calculate_win_probability(matchup['team_score'], matchup['opponent_score'], my_rem, opp_rem)
+                        matchup['win_probability'] = win_probability
+                except Exception as e:
+                    print(f"Error calculating win probability: {e}")
 
             # 6. Generate Strategy Recommendations
             recommendations = []
-            if my_roster_player_names:
+
+            # A.0 Category Performance Analysis
+            if radar_data:
+                # Sort categories by performance (lowest score first)
+                sorted_cats = sorted(radar_data, key=lambda x: x['My Team'])
+                
+                # Identify significant weakness (My Team score significantly below League Avg)
+                weakest = sorted_cats[0]
+                if weakest['My Team'] < weakest['League Avg'] - 10: # Threshold for alert
+                     recommendations.append({
+                        "type": "warning",
+                        "message": f"Category Alert: Your team is underperforming in {weakest['subject']}. Consider targeting this category in trades or free agency."
+                    })
+                
+                # Identify surplus
+                strongest = sorted_cats[-1]
+                if strongest['My Team'] > strongest['League Avg'] + 15:
+                     recommendations.append({
+                        "type": "success",
+                        "message": f"Category Surplus: Your {strongest['subject']} is dominant. You may be able to trade from this depth."
+                    })
+
+            # A. Matchup Insights (H2H)
+            if matchup and matchup.get('opponent_name') != "N/A":
+                score_diff = matchup['team_score'] - matchup['opponent_score']
+                # Heuristic: If scores are non-zero, treat as Points league, otherwise Categories
+                is_h2h_points = matchup['team_score'] > 0 or matchup['opponent_score'] > 0 
+                
+                if not matchup['winning']:
+                    msg = f"Trailing {matchup['opponent_name']}"
+                    if is_h2h_points:
+                        msg += f" by {abs(score_diff):.1f} pts."
+                    else:
+                        msg += "."
+                    recommendations.append({
+                        "type": "alert",
+                        "message": msg + " Review your lineup for streaming opportunities."
+                    })
+                elif matchup['winning']:
+                    msg = f"Leading {matchup['opponent_name']}"
+                    if is_h2h_points:
+                        msg += f" by {score_diff:.1f} pts."
+                    recommendations.append({
+                        "type": "success",
+                        "message": msg + " Keep applying pressure."
+                    })
+
+            # B. Waiver Wire Intelligence (Top Available Players)
+            try:
+                # sort=OR (Owned Rank) gives us high % owned players who are free agents (status=A)
+                fa_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/players;status=A;sort=OR;count=3"
+                res_fa = await client.get(fa_url)
+                if res_fa.status_code == 200:
+                    fa_data = res_fa.json()['fantasy_content']['league'][1].get('players', {})
+                    if isinstance(fa_data, dict) and 'count' in fa_data:
+                        for i in range(safe_int(fa_data['count'])):
+                            if str(i) in fa_data:
+                                p_wrapper = fa_data[str(i)]['player'][0]
+                                p_meta = _parse_yahoo_resource(p_wrapper)
+                                p_name = p_meta.get('name', {}).get('full', 'Unknown')
+                                recommendations.append({
+                                    "type": "suggestion",
+                                    "message": f"Waiver Wire Gem: {p_name} is available in your league."
+                                })
+            except Exception as e:
+                print(f"Warning: Failed to fetch FA recommendations: {e}")
+
+            # Only run projections if we actually have players and a projection file
+            if my_roster_player_names and os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'hitter_projections.csv')):
                 projections_df = fetch_2026_projections()
                 # Limit to avoid too many recommendations
                 recs_generated = 0
@@ -573,20 +1004,26 @@ async def get_dashboard(
                         if anti_tilt_metrics and anti_tilt_metrics.get('recommendation'):
                             recommendations.append({
                                 "type": "success" if "unlucky" in anti_tilt_metrics['recommendation'].lower() else "warning",
-                                "message": f"{player_name}: {anti_tilt_metrics['recommendation']}"
+                                "message": f"{player_name}: {anti_tilt_metrics['recommendation']}",
+                                "player_id": player_id,
+                                "player_name": player_name
                             })
                             recs_generated += 1
 
-            # 7. Return combined data
+            # 7. Get Recent Transactions (Activity Feed)
+            transactions_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/transactions;types=add,drop,trade;count=8"
+            res = await client.get(transactions_url)
+            res.raise_for_status()
+            
+            t_data = res.json()['fantasy_content']['league'][1].get('transactions', {})
+            recent_activity = _parse_transactions(t_data)
+
+            # 8. Return combined data
             return {
                 "matchup": matchup,
                 "standings": sorted(standings, key=lambda x: x['rank']),
-                # NOTE: Yahoo transaction parsing is complex and is stubbed for now.
-                "activity": [
-                    {"id": 1, "time": "2 hours ago", "team": "Team A", "action": "dropped", "player": "Player X", "added": "Player Y"},
-                    {"id": 2, "time": "4 hours ago", "team": "Team B", "action": "added", "player": "Player Z", "type": "FA"},
-                ],
-                "strategy": {"recommendations": recommendations}
+                "activity": recent_activity,
+                "strategy": {"recommendations": recommendations, "radar_data": radar_data}
             }
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
@@ -599,11 +1036,98 @@ async def get_dashboard(
             print(f"Yahoo API Error: {e.response.text}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Error fetching data from Yahoo: {e.response.text}")
         except (KeyError, IndexError) as e:
+            import traceback
+            traceback.print_exc()
             print(f"Error parsing Yahoo API response: {e}")
             raise HTTPException(status_code=500, detail="Error parsing data from Yahoo. The API response structure may have changed.")
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
             raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
+
+@app.get("/api/v1/league/transactions")
+async def get_league_transactions(
+    request: Request,
+    count: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    team_key: Optional[str] = Query(None),
+    league_key: Optional[str] = Query(None)
+):
+    token = await get_valid_token()
+    if not token:
+        token = request.session.get("yahoo_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No Yahoo Token found.")
+
+    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token['access_token']}"}, params={"format": "json"}) as client:
+        try:
+            my_team_key = team_key
+            my_league_key = league_key
+
+            # Discovery Logic (Simplified from get_dashboard)
+            if not my_league_key:
+                if my_team_key:
+                     parts = my_team_key.split('.t.')
+                     if len(parts) > 0:
+                        my_league_key = parts[0]
+                else:
+                    # Fetch game and team to find league
+                    user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games"
+                    res = await client.get(user_games_url)
+                    res.raise_for_status()
+                    data = res.json()
+                    
+                    games = data['fantasy_content']['users']['0']['user'][1]['games']
+                    mlb_game = None
+                    for i in range(safe_int(games.get('count', 0))):
+                        game_obj = games[str(i)]['game']
+                        # Handle list vs dict structure
+                        if isinstance(game_obj, list): game_data = game_obj[0]
+                        elif isinstance(game_obj, dict) and '0' in game_obj: game_data = game_obj['0']
+                        else: game_data = game_obj
+                        
+                        if game_data.get('code') == 'mlb' and game_data.get('season') == '2026':
+                            mlb_game = game_data
+                            break
+                    
+                    if not mlb_game:
+                        raise HTTPException(status_code=404, detail="No 2026 MLB game found.")
+                    
+                    user_teams_url = f"https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys={mlb_game['game_key']}/teams"
+                    res = await client.get(user_teams_url)
+                    res.raise_for_status()
+                    team_list = res.json()['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']
+                    
+                    if safe_int(team_list.get('count', 0)) > 0:
+                        # Safely parse the first team's metadata
+                        team_wrapper = team_list['0']['team']
+                        first_team = {}
+                        if isinstance(team_wrapper, list) and len(team_wrapper) > 0:
+                            first_team = _parse_yahoo_resource(team_wrapper[0])
+                        
+                        my_league_key = first_team.get('league_key')
+                        
+                        # Fallback: Derive league key from team key if missing
+                        if not my_league_key and first_team.get('team_key'):
+                             parts = first_team['team_key'].split('.t.')
+                             if len(parts) > 0:
+                                 my_league_key = parts[0]
+            
+            if not my_league_key:
+                 raise HTTPException(status_code=404, detail="Could not determine league key.")
+
+            # Fetch Transactions
+            transactions_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/transactions;types=add,drop,trade;count={count};start={offset}"
+            res = await client.get(transactions_url)
+            res.raise_for_status()
+            
+            t_data = res.json()['fantasy_content']['league'][1].get('transactions', {})
+            return _parse_transactions(t_data)
+
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            print(f"Error fetching transactions: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/dashboard/mock")
 async def get_dashboard_mock():
@@ -639,3 +1163,354 @@ async def get_dashboard_mock():
              ]
         }
     }
+
+@app.get("/api/v1/matchup/details")
+async def get_matchup_details(
+    request: Request,
+    team_key: Optional[str] = Query(None),
+    league_key: Optional[str] = Query(None)
+):
+    token = await get_valid_token()
+    if not token:
+        token = request.session.get("yahoo_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No Yahoo Token found.")
+
+    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token['access_token']}"}, params={"format": "json"}) as client:
+        try:
+            # Reuse discovery logic (simplified)
+            my_team_key = team_key
+            if not my_team_key:
+                # Quick fetch to find team key if not provided
+                user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys=mlb/teams"
+                res = await client.get(user_games_url)
+                res.raise_for_status()
+                data = res.json()
+                try:
+                    team_wrapper = data['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']['0']['team'][0]
+                    my_team = _parse_yahoo_resource(team_wrapper)
+                    my_team_key = my_team['team_key']
+                except (KeyError, IndexError):
+                    raise HTTPException(status_code=404, detail="Could not automatically find your MLB team.")
+
+            # Fetch Matchup
+            matchup_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_team_key}/matchups"
+            res = await client.get(matchup_url)
+            res.raise_for_status()
+            
+            team_data = res.json()['fantasy_content']['team'][1]
+            matchups = team_data.get('matchups', {})
+            
+            if isinstance(matchups, dict) and matchups.get('count', 0) > 0 and '0' in matchups:
+                matchup_payload = matchups['0']['matchup']
+                teams_in_matchup = matchup_payload['0']['teams']
+                
+                # Parse both teams
+                def _get_team_info(idx):
+                    wrapper = teams_in_matchup[str(idx)]['team']
+                    data = {}
+                    if isinstance(wrapper, list):
+                        # Index 0 is usually the metadata list
+                        if len(wrapper) > 0 and isinstance(wrapper[0], list):
+                            data.update(_parse_yahoo_resource(wrapper[0]))
+                        
+                        # The rest are dicts (team_standings, team_points, etc.)
+                        for item in wrapper:
+                            if isinstance(item, dict):
+                                data.update(item)
+                    
+                    meta = {k: v for k, v in data.items() if k not in ['team_points', 'team_stats']}
+                    points = data.get('team_points', {})
+                    
+                    # Extract detailed stats
+                    stats = {}
+                    if 'team_stats' in data and 'stats' in data['team_stats']:
+                        for stat_item in data['team_stats']['stats']:
+                            stat = stat_item.get('stat', {})
+                            s_id = str(stat.get('stat_id'))
+                            s_val = stat.get('value')
+                            if s_id in STAT_ID_MAP:
+                                try:
+                                    stats[STAT_ID_MAP[s_id]] = float(s_val) if s_val and s_val != '-' else 0.0
+                                except (ValueError, TypeError):
+                                    stats[STAT_ID_MAP[s_id]] = 0.0
+                                    
+                    return meta, points, stats
+
+                team0_meta, team0_points, team0_stats = _get_team_info(0)
+                team1_meta, team1_points, team1_stats = _get_team_info(1)
+
+                is_team0_me = team0_meta.get('team_key') == my_team_key
+                my_team_meta, opp_team_meta = (team0_meta, team1_meta) if is_team0_me else (team1_meta, team0_meta)
+                my_points, opp_points = (team0_points, team1_points) if is_team0_me else (team1_points, team0_points)
+                my_stats, opp_stats = (team0_stats, team1_stats) if is_team0_me else (team1_stats, team0_stats)
+
+                # Fetch Rosters and Season Stats for both teams
+                my_key = my_team_meta['team_key']
+                opp_key = opp_team_meta['team_key']
+                
+                urls = {
+                    "opp_roster": f"https://fantasysports.yahooapis.com/fantasy/v2/team/{opp_key}/roster",
+                    "my_roster": f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_key}/roster",
+                    "my_season": f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_key}/stats",
+                    "opp_season": f"https://fantasysports.yahooapis.com/fantasy/v2/team/{opp_key}/stats"
+                }
+
+                responses = {}
+                # Fetch all in parallel
+                reqs = [client.get(url) for url in urls.values()]
+                results = await asyncio.gather(*reqs, return_exceptions=True)
+                
+                for key, res in zip(urls.keys(), results):
+                    if isinstance(res, httpx.Response) and res.status_code == 200:
+                        responses[key] = res.json()
+                    else:
+                        responses[key] = None
+
+                # Load projections for ID mapping
+                try:
+                    projections_df = fetch_2026_projections()
+                    name_to_id = dict(zip(projections_df['name'], projections_df['id']))
+                except Exception:
+                    projections_df = pd.DataFrame()
+                    name_to_id = {}
+
+                # Helper to extract roster details
+                def _extract_roster_detailed(json_data):
+                    players = []
+                    if json_data:
+                        r_raw = json_data['fantasy_content']['team'][1].get('roster', {}).get('0', {}).get('players', {})
+                        if isinstance(r_raw, dict):
+                            for i in range(safe_int(r_raw.get('count', 0))):
+                                if str(i) in r_raw:
+                                    player_wrapper = r_raw[str(i)]['player']
+                                    p_meta = _parse_yahoo_resource(player_wrapper[0]) if isinstance(player_wrapper, list) else {}
+                                    
+                                    # Find selected position (starting slot)
+                                    current_slot = "BN"
+                                    if isinstance(player_wrapper, list):
+                                        for item in player_wrapper:
+                                            if isinstance(item, dict) and 'selected_position' in item:
+                                                current_slot = item['selected_position'][1].get('position')
+                                    
+                                    p_name = p_meta.get('name', {}).get('full', 'Unknown')
+                                    players.append({
+                                        'name': p_name,
+                                        'team': p_meta.get('editorial_team_abbr', '').upper(),
+                                        'position': p_meta.get('display_position'),
+                                        'headshot': p_meta.get('headshot', {}).get('url'),
+                                        'status': p_meta.get('status'),
+                                        'current_slot': current_slot,
+                                        'id': name_to_id.get(p_name)
+                                    })
+                    return players
+
+                opp_roster_details = _extract_roster_detailed(responses.get("opp_roster"))
+                my_roster_details = _extract_roster_detailed(responses.get("my_roster"))
+
+                my_roster_names = [p['name'] for p in my_roster_details]
+                opp_roster_names = [p['name'] for p in opp_roster_details]
+
+                # Helper to extract stats
+                def _extract_stats(json_data):
+                    stats = {}
+                    if json_data:
+                        t_data = json_data['fantasy_content']['team'][1]
+                        if 'team_stats' in t_data and 'stats' in t_data['team_stats']:
+                            for stat_item in t_data['team_stats']['stats']:
+                                stat = stat_item.get('stat', {})
+                                s_id = str(stat.get('stat_id'))
+                                s_val = stat.get('value')
+                                if s_id in STAT_ID_MAP:
+                                    try:
+                                        stats[STAT_ID_MAP[s_id]] = float(s_val) if s_val and s_val != '-' else 0.0
+                                    except (ValueError, TypeError):
+                                        stats[STAT_ID_MAP[s_id]] = 0.0
+                    return stats
+
+                my_season_stats = _extract_stats(responses.get("my_season"))
+                opp_season_stats = _extract_stats(responses.get("opp_season"))
+
+                # Generate "AI" Insights
+                insights = []
+                score_diff = float(my_points.get('total', 0)) - float(opp_points.get('total', 0))
+                
+                if score_diff > 0:
+                    insights.append(f"You are currently leading by {score_diff:.2f} points. Keep the pressure on.")
+                elif score_diff < 0:
+                    insights.append(f"You are trailing by {abs(score_diff):.2f} points. Look for streaming pitchers to close the gap.")
+                
+                if opp_roster_names:
+                    insights.append(f"Opponent Key Threat: Watch out for {opp_roster_names[0] if opp_roster_names else 'their stars'}.")
+                
+                # --- FETCH DAILY SCHEDULE & MAP TO PLAYERS ---
+                try:
+                    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+                    sch_url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={today_str}"
+                    sch_res = await client.get(sch_url)
+                    if sch_res.status_code == 200:
+                        games = sch_res.json().get('dates', [{}])[0].get('games', [])
+                        game_map = {}
+                        for g in games:
+                            home = g['teams']['home']['team'].get('abbreviation')
+                            away = g['teams']['away']['team'].get('abbreviation')
+                            status = g['status']['abstractGameState'] # Preview, Live, Final
+                            game_date = g.get('gameDate') # ISO 8601
+                            
+                            if home: game_map[home] = {'opponent': away, 'is_home': True, 'time': game_date, 'status': status}
+                            if away: game_map[away] = {'opponent': home, 'is_home': False, 'time': game_date, 'status': status}
+                        
+                        for p in my_roster_details + opp_roster_details:
+                            if p['team'] in game_map:
+                                p['game'] = game_map[p['team']]
+                except Exception as e:
+                    print(f"Error mapping schedule: {e}")
+                
+                # Calculate Projected Stats (Local)
+                my_projected = {}
+                opp_projected = {}
+                
+                # New variables for total score projection
+                my_final_proj_score = 0.0
+                opp_final_proj_score = 0.0
+                win_prob = 50.0
+
+                try:
+                    # Helper to sum projections for a roster
+                    def _calc_proj(roster_names):
+                        if not roster_names: return {}
+                        # Filter DF by names in roster
+                        team_df = projections_df[projections_df['name'].isin(roster_names)]
+                        # Sum columns that match our STAT_ID_MAP values
+                        cols = [col for col in STAT_ID_MAP.values() if col in team_df.columns]
+                        sums = team_df[cols].sum().to_dict()
+                        return {k: float(v) for k, v in sums.items()}
+
+                    my_projected = _calc_proj(my_roster_names)
+                    opp_projected = _calc_proj(opp_roster_names)
+                    
+                    # --- AI PREDICTION LOGIC ---
+                    # Calculate "Rest of Week" factor
+                    current_day = datetime.datetime.now().weekday() # 0=Mon, 6=Sun
+                    days_remaining = max(1, 7 - current_day)
+                    time_factor = days_remaining / 182.0 # Approx season fraction
+                    
+                    def _get_season_points_sum(names):
+                        if not names: return 0.0
+                        rows = projections_df[projections_df['name'].isin(names)]
+                        if 'total_points' not in rows.columns:
+                             rows = _calculate_dataframe_points(rows)
+                        return rows['total_points'].sum()
+
+                    my_rem_points = _get_season_points_sum(my_roster_names) * time_factor
+                    opp_rem_points = _get_season_points_sum(opp_roster_names) * time_factor
+                    
+                    my_current_score = float(my_points.get('total', 0))
+                    opp_current_score = float(opp_points.get('total', 0))
+                    
+                    my_final_proj_score = my_current_score + my_rem_points
+                    opp_final_proj_score = opp_current_score + opp_rem_points
+                    
+                    win_prob, _, _ = _calculate_win_probability(my_current_score, opp_current_score, my_rem_points, opp_rem_points)
+                    
+                    # --- CATEGORY ANALYSIS ---
+                    close_cats = []
+                    for stat_id, stat_name in STAT_ID_MAP.items():
+                        if stat_name in my_stats and stat_name in opp_stats:
+                            m_val = my_stats[stat_name]
+                            o_val = opp_stats[stat_name]
+                            diff = abs(m_val - o_val)
+                            
+                            # Define thresholds for "close"
+                            is_close = False
+                            if stat_name in ['ERA', 'WHIP']:
+                                if diff < 0.2: is_close = True
+                            elif stat_name == 'AVG':
+                                if diff < 0.010: is_close = True
+                            else: # Counting stats
+                                if diff <= 2: is_close = True
+                            
+                            if is_close:
+                                close_cats.append(f"{stat_name} ({m_val} vs {o_val})")
+                    
+                    if close_cats:
+                        insights.append(f"Nail-biters: {', '.join(close_cats[:3])}. Every stat counts!")
+                    
+                except Exception as proj_err:
+                    print(f"Error calculating projections: {proj_err}")
+
+                return {
+                    "my_team": {
+                        **my_team_meta, "score": my_points.get('total', 0), 
+                        "stats": my_stats, "season_stats": my_season_stats, "projected_stats": my_projected,
+                        "roster": my_roster_details
+                    },
+                    "opponent": {
+                        **opp_team_meta, "score": opp_points.get('total', 0), "roster": opp_roster_details, 
+                        "stats": opp_stats, "season_stats": opp_season_stats, "projected_stats": opp_projected
+                    },
+                    "insights": insights,
+                    "projections": {
+                        "my_total": my_final_proj_score,
+                        "opp_total": opp_final_proj_score,
+                        "win_probability": win_prob
+                    }
+                }
+            
+            raise HTTPException(status_code=404, detail="No active matchup found.")
+
+        except Exception as e:
+            print(f"Error in matchup details: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/mlb/scores")
+async def get_mlb_scores():
+    """Fetches today's MLB scores."""
+    try:
+        # Approximate "baseball date". In production this should handle TZs better.
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={today}&hydrate=team"
+        
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            
+        games = []
+        if data.get('totalGames', 0) > 0:
+            for g in data.get('dates', [{}])[0].get('games', []):
+                home = g.get('teams', {}).get('home', {})
+                away = g.get('teams', {}).get('away', {})
+                
+                home_team = home.get('team', {})
+                away_team = away.get('team', {})
+                
+                status = g.get('status', {}).get('abstractGameState', 'Preview') # Preview, Live, Final
+                detailed_state = g.get('status', {}).get('detailedState', '')
+                
+                game_info = {
+                    "id": g['gamePk'],
+                    "status": status,
+                    "detailed_status": detailed_state,
+                    "home": home_team.get('abbreviation') or home_team.get('name', 'UNK'),
+                    "home_id": home_team.get('id'),
+                    "home_score": home.get('score', ''),
+                    "away": away_team.get('abbreviation') or away_team.get('name', 'UNK'),
+                    "away_id": away_team.get('id'),
+                    "away_score": away.get('score', ''),
+                    "is_active": status == "Live",
+                }
+                
+                if status == "Live":
+                    linescore = g.get('linescore', {})
+                    game_info["inning"] = linescore.get('currentInningOrdinal', '')
+                    game_info["is_top"] = linescore.get('isTopInning', False)
+                
+                games.append(game_info)
+        return games
+    except Exception as e:
+        print(f"Error fetching MLB scores: {e}")
+        return []
+
+app.include_router(router)

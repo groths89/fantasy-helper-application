@@ -1,5 +1,6 @@
 import React from 'react';
 import { Newspaper } from 'lucide-react';
+import { Link } from 'react-router-dom';
 
 const LeagueActivity = ({ activity }) => {
   if (!activity) return <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 animate-pulse h-64"></div>;
@@ -35,7 +36,9 @@ const LeagueActivity = ({ activity }) => {
         ))}
       </div>
       <div className="p-2 text-center border-t border-gray-100">
-        <button className="text-xs font-bold text-blue-600 hover:text-blue-700 uppercase tracking-wide">View All Activity</button>
+        <Link to="/transactions" className="block w-full py-2 text-xs font-bold text-blue-600 hover:text-blue-700 uppercase tracking-wide">
+          View All Activity
+        </Link>
       </div>
     </div>
   );

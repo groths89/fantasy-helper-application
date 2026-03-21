@@ -5,6 +5,7 @@ import MatchupCard from '../components/MatchupCard';
 import StrategyCenter from '../components/StrategyCenter';
 import LeagueActivity from '../components/LeagueActivity';
 import Standings from '../components/Standings';
+import ScoreTicker from '../components/ScoreTicker';
 import { Loader } from 'lucide-react';
 
 const SeasonDashboard = () => {
@@ -49,7 +50,9 @@ const SeasonDashboard = () => {
   if (!data) return <div className="p-8 text-center text-red-500">Failed to load dashboard data.</div>;
 
   return (
-    <main className="container mx-auto px-4 py-8">
+    <>
+      <ScoreTicker />
+      <main className="container mx-auto px-4 py-8">
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Left Column (Main) */}
         <div className="lg:col-span-8 space-y-6">
@@ -63,7 +66,8 @@ const SeasonDashboard = () => {
           <Standings standings={data.standings} />
         </div>
       </div>
-    </main>
+      </main>
+    </>
   );
 };
 

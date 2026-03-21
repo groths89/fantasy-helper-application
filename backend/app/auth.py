@@ -32,6 +32,7 @@ yahoo_client = OAuth2(
     client_secret=YAHOO_CLIENT_SECRET,
     authorize_endpoint="https://api.login.yahoo.com/oauth2/request_auth",
     access_token_endpoint="https://api.login.yahoo.com/oauth2/get_token",
+    refresh_token_endpoint="https://api.login.yahoo.com/oauth2/get_token",
     name="yahoo",
 )
 

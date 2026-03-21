@@ -7,6 +7,7 @@ const AuthContext = createContext(null);
 export const AuthProvider = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [expiresAt, setExpiresAt] = useState(null);
 
 useEffect(() => {
     // Check auth status when the component mounts
@@ -25,10 +26,12 @@ useEffect(() => {
       })
       .then(data => {
         setIsConnected(data.is_connected);
+        setExpiresAt(data.expires_at || null);
       })
       .catch(error => {
         console.error('Error checking auth status:', error);
         setIsConnected(false);
+        setExpiresAt(null);
       })
       .finally(() => {
         setIsLoading(false);
@@ -37,15 +40,19 @@ useEffect(() => {
 
   const logout = async () => {
     try {
-      await fetch(`${API_BASE}/auth/logout`);
+      await fetch(`${API_BASE}/auth/logout`, {
+        method: 'GET',
+        credentials: 'include',
+      });
       setIsConnected(false);
+      setExpiresAt(null);
       window.location.href = '/'; // Redirect to home and let it reload
     } catch (error) {
       console.error('Error logging out:', error);
     }
   };
 
-  const value = { isConnected, isLoading, logout };
+  const value = { isConnected, isLoading, logout, expiresAt };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
