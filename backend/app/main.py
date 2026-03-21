@@ -412,48 +412,24 @@ def _parse_yahoo_resource(resource_list):
             data.update(item)
     return data
 
-TOKEN_PATH = "/automation/token.json"
-
 @app.get("/api/v1/dashboard")
-async def get_dashboard(request: Request):
-    import os as _os
+async def get_dashboard(
+    request: Request,
+    team_key: Optional[str] = Query(None, description="Yahoo Team Key (e.g. 442.l.12345.t.1)"),
+    league_key: Optional[str] = Query(None, description="Yahoo League Key (e.g. 442.l.12345)")
+):
+    # 1. Ensure we have a valid token (refreshes if needed)
+    token = await get_valid_token()
 
-    # Try to get from session first
-    token = request.session.get("yahoo_token")
-    
-    # If session is empty, try to manually read the file from the volume
-    if not token and _os.path.exists(TOKEN_PATH):
-        try:
-            print("DEBUG: Token file found on disk. Loading...")
-            with open(TOKEN_PATH, 'r') as f:
-                token = json.load(f)
-                # Sync it to the session so the next request is authorized
-                request.session["yahoo_token"] = token
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                print("DEBUG: Yahoo Token expired. Attempting refresh...")
-                try:
-                    # Import your refresh logic from the automation folder
-                    import sys
-                    sys.path.append('/automation')
-                    import yahoo_auth
-                    
-                    # This should update token.json automatically
-                    new_token = yahoo_auth.refresh_token() 
-                    
-                    if new_token:
-                        request.session["yahoo_token"] = new_token
-                        print("DEBUG: Token refreshed successfully. Please refresh the page.")
-                        # Optionally: you could recursively call get_dashboard(request) here
-                        # but a 401 with a 'token refreshed' message is safer for now.
-                except Exception as refresh_err:
-                    print(f"DEBUG: Refresh failed: {refresh_err}")
-                
-                raise HTTPException(status_code=401, detail="Yahoo session expired. Token refreshed, please try again.")
-            
     if not token:
-        print("DEBUG: No token found in session or on disk. Raising 401.")
-        raise HTTPException(status_code=401, detail="No Yahoo Token found")
+        # Fallback to session if file-based token failed
+        token = request.session.get("yahoo_token")
+
+    if not token:
+        raise HTTPException(status_code=401, detail="No Yahoo Token found. Please authenticate via /auth/yahoo.")
+    
+    # Sync valid token to session
+    request.session["yahoo_token"] = token
     
     print(f"DEBUG: Attempting Yahoo API call with token ending in ...{token.get('access_token', '')[-5:]}")
 
@@ -462,37 +438,61 @@ async def get_dashboard(request: Request):
         params={"format": "json"}
     ) as client:
         try:
-            # 1. Get current MLB game key
-            user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games"
-            res = await client.get(user_games_url)
-            res.raise_for_status()
-            games = res.json()['fantasy_content']['users']['0']['user'][1]['games']
-            
-            mlb_game = None
-            for i in range(games['count']):
-                game_data = games[str(i)]['game'][0]
-                if game_data.get('code') == 'mlb' and game_data.get('season') == '2026':
-                    mlb_game = game_data
-                    break
-            
-            if not mlb_game:
-                raise HTTPException(status_code=404, detail="No 2026 MLB fantasy game found for this user.")
-            game_key = mlb_game['game_key']
+            my_team_key = team_key
+            my_league_key = league_key
 
-            # 2. Get user's team and league key
-            user_teams_url = f"https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys={game_key}/teams"
-            res = await client.get(user_teams_url)
-            res.raise_for_status()
-            team_list_raw = res.json()['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']
+            # Discovery logic if keys are not provided
+            if not my_team_key:
+                # 1. Get current MLB game key
+                user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games"
+                res = await client.get(user_games_url)
+                res.raise_for_status()
+                
+                data = res.json()
+                if 'fantasy_content' not in data:
+                    raise HTTPException(status_code=500, detail="Unexpected response format from Yahoo")
+
+                games = data['fantasy_content']['users']['0']['user'][1]['games']
+                
+                mlb_game = None
+                # Yahoo returns 'count' and then keys '0', '1', etc.
+                count = games.get('count', 0)
+                for i in range(count):
+                    game_data = games[str(i)]['game'][0]
+                    if game_data.get('code') == 'mlb' and game_data.get('season') == '2026':
+                        mlb_game = game_data
+                        break
+                
+                if not mlb_game:
+                    raise HTTPException(status_code=404, detail="No 2026 MLB fantasy game found for this user.")
+                game_key = mlb_game['game_key']
+
+                # 2. Get user's team and league key
+                user_teams_url = f"https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys={game_key}/teams"
+                res = await client.get(user_teams_url)
+                res.raise_for_status()
+                
+                team_list_raw = res.json()['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']
+                
+                if team_list_raw.get('count', 0) == 0:
+                    raise HTTPException(status_code=404, detail="No teams found in the 2026 season.")
+
+                # Default to the first team found
+                my_team_raw = team_list_raw['0']['team'][0]
+                my_team = _parse_yahoo_resource(my_team_raw)
+                my_team_key = my_team['team_key']
+                my_league_key = my_team['league_key']
             
-            # Assuming user has one team in the league
-            my_team_raw = team_list_raw['0']['team'][0]
-            my_team = _parse_yahoo_resource(my_team_raw)
-            my_team_key = my_team['team_key']
-            league_key = my_team['league_key']
+            # If we have a team key but no league key (passed via param), derive it
+            if not my_league_key and my_team_key:
+                # Standard format: {game}.l.{league}.t.{team}
+                # Splitting by .t. works to isolate the league part
+                parts = my_team_key.split('.t.')
+                if len(parts) > 0:
+                    my_league_key = parts[0]
 
             # 3. Get Standings
-            standings_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{league_key}/standings"
+            standings_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/standings"
             res = await client.get(standings_url)
             res.raise_for_status()
             teams_raw = res.json()['fantasy_content']['league'][1]['standings'][0]['teams']
