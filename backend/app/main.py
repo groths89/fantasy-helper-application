@@ -386,8 +386,12 @@ async def yahoo_callback(request: Request, code: str = None, error: str = None):
 
     # 4. Tell React the user is logged in
     # Redirect back to your frontend dashboard
-    default_frontend_url = "https://gregsfantasyhelper.solutions" if is_prod else "http://localhost:5173"
-    frontend_url = os.getenv("FRONTEND_URL", default_frontend_url)
+    frontend_url = "http://localhost:5173"
+    if os.getenv("FRONTEND_URL"):
+        frontend_url = os.getenv("FRONTEND_URL")
+    elif is_prod or "gregsfantasyhelper.solutions" in YAHOO_REDIRECT_URI:
+        frontend_url = "https://gregsfantasyhelper.solutions"
+
     return RedirectResponse(url=f"{frontend_url}/dashboard?login=success")
 
 # NOTE: This is for development and testing only.

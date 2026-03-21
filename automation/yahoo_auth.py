@@ -23,6 +23,7 @@ yahoo_client = OAuth2(
     client_secret=YAHOO_CLIENT_SECRET,
     authorize_endpoint="https://api.login.yahoo.com/oauth2/request_auth",
     access_token_endpoint="https://api.login.yahoo.com/oauth2/get_token",
+    refresh_token_endpoint="https://api.login.yahoo.com/oauth2/get_token",
     name="yahoo",
 )
 
@@ -47,7 +48,7 @@ async def get_new_token():
 
     authorization_url = await yahoo_client.get_authorization_url(
         redirect_uri=YAHOO_REDIRECT_URI,
-        scope="fspt-w",  # Request write-scope to allow roster changes
+        scope="fspt-r",  # Request write-scope to allow roster changes
     )
     print("Please go to this URL and authorize the application:")
     print(authorization_url)
