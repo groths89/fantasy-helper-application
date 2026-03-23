@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { getDashboardData } from '../services/api';
 import MatchupCard from '../components/MatchupCard';
 import StrategyCenter from '../components/StrategyCenter';
 import LeagueActivity from '../components/LeagueActivity';
 import Standings from '../components/Standings';
 import ScoreTicker from '../components/ScoreTicker';
-import { Loader } from 'lucide-react';
+import { Loader, Users } from 'lucide-react';
 
 const SeasonDashboard = () => {
   const [data, setData] = useState(null);
@@ -62,6 +62,18 @@ const SeasonDashboard = () => {
 
         {/* Right Column (Sidebar) */}
         <div className="lg:col-span-4 space-y-6">
+          <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 flex items-center justify-between">
+            <div>
+              <h3 className="font-bold text-gray-800 text-sm">My Roster</h3>
+              <p className="text-xs text-gray-500">Projections & Analysis</p>
+            </div>
+            <Link 
+              to="/team" 
+              className="flex items-center justify-center bg-blue-50 text-blue-600 hover:bg-blue-100 p-2 rounded-lg transition-colors border border-blue-100"
+            >
+              <Users size={20} />
+            </Link>
+          </div>
           <LeagueActivity activity={data.activity} />
           <Standings standings={data.standings} />
         </div>

@@ -3,6 +3,7 @@ import { Zap, TrendingUp, AlertCircle, CheckCircle, Lightbulb, AlertTriangle, X,
 import AutomationLogs from './AutomationLogs';
 import AntiTiltModal from './AntiTiltModal';
 import { getAntiTiltMetrics } from '../services/api';
+import AnalyzePlayerModal from './AnalyzePlayerModal';
 import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Legend, Tooltip } from 'recharts';
 
 const CustomRadarTooltip = ({ active, payload, label }) => {
@@ -34,6 +35,7 @@ const StrategyCenter = ({ strategy }) => {
   const [filter, setFilter] = useState('all'); // 'all', 'critical', 'opportunity'
   const [tiltPlayer, setTiltPlayer] = useState(null);
   const [tiltMetrics, setTiltMetrics] = useState(null);
+  const [analyzePlayer, setAnalyzePlayer] = useState(null);
 
   if (!strategy) return <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 animate-pulse h-64"></div>;
 
@@ -85,6 +87,10 @@ const StrategyCenter = ({ strategy }) => {
   const handleCloseTilt = () => {
     setTiltPlayer(null);
     setTiltMetrics(null);
+  };
+
+  const handleAnalyze = (rec) => {
+    setAnalyzePlayer({ name: rec.player_name, id: rec.player_id });
   };
 
   return (
@@ -158,7 +164,10 @@ const StrategyCenter = ({ strategy }) => {
                         <p className="leading-snug font-medium">{rec.message}</p>
                         {rec.type === 'suggestion' && (
                             <div className="mt-2 flex gap-2">
-                                <button className="text-[10px] bg-white/50 hover:bg-white border border-transparent hover:border-purple-200 px-2 py-1 rounded font-bold text-purple-700 transition-colors">
+                                <button 
+                                    onClick={() => handleAnalyze(rec)}
+                                    className="text-[10px] bg-white/50 hover:bg-white border border-transparent hover:border-purple-200 px-2 py-1 rounded font-bold text-purple-700 transition-colors"
+                                >
                                     Analyze Player
                                 </button>
                             </div>
@@ -213,6 +222,10 @@ const StrategyCenter = ({ strategy }) => {
         player={tiltPlayer}
         metrics={tiltMetrics}
         onClose={handleCloseTilt}
+      />
+      <AnalyzePlayerModal
+        player={analyzePlayer}
+        onClose={() => setAnalyzePlayer(null)}
       />
     </div>
   );

@@ -4,6 +4,7 @@ import SeasonDashboard from './views/SeasonDashboard';
 import Transactions from './views/Transactions';
 import DraftRoom from './views/DraftRoom';
 import Matchup from './views/Matchup';
+import TeamAnalysis from './views/TeamAnalysis';
 import Settings from './views/Settings';
 import Header from './components/Header';
 import { useAuth } from './context/AuthContext';
@@ -28,6 +29,7 @@ function App() {
         <Route path="/" element={isConnected ? <SeasonDashboard /> : <HomePage />} /> {/* Home page is conditional */}
         <Route path="/dashboard" element={isConnected ? <SeasonDashboard /> : <Navigate to="/" replace />} /> {/* Protected route */}
         <Route path="/matchup" element={isConnected ? <Matchup /> : <Navigate to="/" replace />} /> {/* Protected route */}
+        <Route path="/team" element={isConnected ? <TeamAnalysis /> : <Navigate to="/" replace />} /> {/* Protected route */}
         <Route path="/transactions" element={isConnected ? <Transactions />: <Navigate to="/" replace />} /> {/* Protected route - Transactions page */}
         <Route path="/draft" element={isConnected ? <DraftRoom /> : <Navigate to="/" replace />} /> {/* Protected route */}
         <Route path="/settings" element={isConnected ? <Settings /> : <Navigate to="/" replace />} /> {/* Protected route */}

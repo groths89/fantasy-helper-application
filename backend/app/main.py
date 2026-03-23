@@ -31,6 +31,9 @@ router = APIRouter()
 
 app = FastAPI(title="Fantasy Baseball Helper API")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+
 is_prod = os.getenv("ENVIRONMENT") == "production"
 
 app.add_middleware(
@@ -292,6 +295,117 @@ async def get_ai_recommendations(request: RecommendationRequest):
         # Return a generic error to the client
         raise HTTPException(status_code=500, detail="An error occurred while generating recommendations.")
 
+@app.get("/api/v1/draft/live")
+async def get_live_draft(request: Request, team_key: Optional[str] = Query(None)):
+    """Fetches live draft results from Yahoo and maps them to our player data."""
+    token = await get_valid_token()
+    if not token:
+        token = request.session.get("yahoo_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No Yahoo Token found.")
+        
+    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token['access_token']}"}, params={"format": "json"}) as client:
+        try:
+            # 1. Discovery (Find Team & League)
+            my_team_key = team_key
+            if not my_team_key:
+                # Quick fetch to find team key if not provided
+                user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys=mlb/teams"
+                res = await client.get(user_games_url)
+                if res.status_code == 200:
+                    data = res.json()
+                    try:
+                        team_wrapper = data['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']['0']['team'][0]
+                        my_team = _parse_yahoo_resource(team_wrapper)
+                        my_team_key = my_team['team_key']
+                    except (KeyError, IndexError):
+                        pass
+            
+            if not my_team_key:
+                 # Return empty if we can't find a team (maybe draft hasn't started or context missing)
+                 return []
+
+            my_league_key = my_team_key.split('.t.')[0]
+
+            # 2. Fetch Draft Results
+            url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/draftresults"
+            res = await client.get(url)
+            res.raise_for_status()
+            
+            data = res.json()
+            l_data = data['fantasy_content']['league'][1]
+            dr_node = l_data.get('draft_results', {})
+            
+            results = []
+            if isinstance(dr_node, dict) and 'count' in dr_node:
+                # Load projections for lookup
+                projections_df = fetch_2026_projections()
+                player_map = {}
+                if not projections_df.empty:
+                    for _, row in projections_df.iterrows():
+                        player_map[safe_int(row['id'])] = row.to_dict()
+
+                # 1. Identify valid draft picks and find missing players
+                draft_items = []
+                missing_keys = []
+
+                count = safe_int(dr_node['count'])
+                for i in range(count):
+                    if str(i) not in dr_node: continue
+                    pick_wrapper = dr_node[str(i)]['draft_result']
+                    p_key = pick_wrapper.get('player_key')
+                    if p_key:
+                        p_id = safe_int(p_key.split('.p.')[-1])
+                        draft_items.append((pick_wrapper, p_id))
+                        if p_id not in player_map:
+                            missing_keys.append(p_key)
+
+                # 2. Batch fetch missing players from Yahoo (25 keys max per request)
+                fetched_players = {}
+                if missing_keys:
+                    unique_keys = list(set(missing_keys))
+                    chunk_size = 25
+                    chunks = [unique_keys[i:i + chunk_size] for i in range(0, len(unique_keys), chunk_size)]
+                    
+                    for chunk in chunks:
+                        try:
+                            keys_str = ",".join(chunk)
+                            p_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/players;player_keys={keys_str}"
+                            p_res = await client.get(p_url)
+                            if p_res.status_code == 200:
+                                p_data = p_res.json()['fantasy_content']['league'][1].get('players', {})
+                                if isinstance(p_data, dict) and 'count' in p_data:
+                                    for k in range(safe_int(p_data['count'])):
+                                        if str(k) in p_data:
+                                            p_meta = _parse_yahoo_resource(p_data[str(k)]['player'][0])
+                                            pid = safe_int(p_meta.get('player_id'))
+                                            fetched_players[pid] = {
+                                                "id": pid,
+                                                "name": p_meta.get('name', {}).get('full', 'Unknown'),
+                                                "position": p_meta.get('display_position', 'Bench'),
+                                                "team": p_meta.get('editorial_team_abbr', 'UNK')
+                                            }
+                        except Exception as e:
+                            print(f"Error fetching missing players chunk: {e}")
+
+                # 3. Build final result list
+                for pick_wrapper, p_id in draft_items:
+                    # Try local map, then fetched Yahoo data, then fallback
+                    player_details = player_map.get(p_id) or fetched_players.get(p_id)
+                    
+                    if not player_details:
+                        player_details = { "id": p_id, "name": "Unknown Player", "position": "Bench", "team": "UNK" }
+                    else:
+                        # Clean NaNs
+                        player_details = {k: (v if pd.notna(v) else None) for k, v in player_details.items()}
+                    
+                    is_me = (pick_wrapper.get('team_key') == my_team_key)
+                    results.append({ "pick": safe_int(pick_wrapper.get('pick')), "round": safe_int(pick_wrapper.get('round')), "player": player_details, "by": "me" if is_me else "opponent" })
+            return sorted(results, key=lambda x: x['pick'])
+        except Exception as e:
+            print(f"Error fetching live draft: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/v1/projections/upload/{player_type}")
 async def upload_projections(player_type: str, file: UploadFile = File(...)):
   """
@@ -321,9 +435,9 @@ async def upload_projections(player_type: str, file: UploadFile = File(...)):
       raise HTTPException(status_code=400, detail=f"Error processing CSV file: {e}")
 
   try:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
     file_name = "hitter_projections.csv" if player_type == "hitters" else "pitcher_projections.csv"
-    csv_path = os.path.join(base_dir, 'data', file_name)
+    csv_path = os.path.join(DATA_DIR, file_name)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
     with open(csv_path, "wb") as buffer:
         buffer.write(contents)
@@ -983,15 +1097,19 @@ async def get_dashboard(
                                 p_wrapper = fa_data[str(i)]['player'][0]
                                 p_meta = _parse_yahoo_resource(p_wrapper)
                                 p_name = p_meta.get('name', {}).get('full', 'Unknown')
+                                p_id = p_meta.get('player_id')
                                 recommendations.append({
                                     "type": "suggestion",
-                                    "message": f"Waiver Wire Gem: {p_name} is available in your league."
+                                    "message": f"Waiver Wire Gem: {p_name} is available in your league.",
+                                    "player_id": p_id,
+                                    "player_name": p_name
                                 })
             except Exception as e:
                 print(f"Warning: Failed to fetch FA recommendations: {e}")
 
-            # Only run projections if we actually have players and a projection file
-            if my_roster_player_names and os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'hitter_projections.csv')):
+            # C. Analyze Player (Anti-Tilt)
+            # Only run if we have players and projections
+            if my_roster_player_names and os.path.exists(os.path.join(DATA_DIR, 'hitter_projections.csv')):
                 projections_df = fetch_2026_projections()
                 # Limit to avoid too many recommendations
                 recs_generated = 0
@@ -1032,8 +1150,6 @@ async def get_dashboard(
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 # Token likely expired, clear it and force re-login
-                import os
-                from app.auth import TOKEN_FILE
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
                 raise HTTPException(status_code=401, detail="Yahoo token expired or invalid. Please re-authenticate.")
@@ -1516,5 +1632,88 @@ async def get_mlb_scores():
     except Exception as e:
         print(f"Error fetching MLB scores: {e}")
         return []
+
+@app.get("/api/v1/team")
+async def get_team(request: Request, team_key: Optional[str] = Query(None)):
+    """
+    Fetches detailed roster information including season stats and projections for the user's team.
+    """
+    token = await get_valid_token()
+    if not token:
+        token = request.session.get("yahoo_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No Yahoo Token found.")
+
+    async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token['access_token']}"}, params={"format": "json"}) as client:
+        try:
+            my_team_key = team_key
+            if not my_team_key:
+                # Simplified discovery
+                user_games_url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys=mlb/teams"
+                res = await client.get(user_games_url)
+                res.raise_for_status()
+                data = res.json()
+                try:
+                    # Try to find the first team
+                    teams_node = data['fantasy_content']['users']['0']['user'][1]['games']['0']['game'][1]['teams']
+                    if safe_int(teams_node.get('count', 0)) > 0:
+                        team_wrapper = teams_node['0']['team'][0]
+                        my_team = _parse_yahoo_resource(team_wrapper)
+                        my_team_key = my_team['team_key']
+                except (KeyError, IndexError):
+                    pass
+            
+            if not my_team_key:
+                 raise HTTPException(status_code=404, detail="Could not find your team.")
+
+            # Fetch Roster with Season Stats
+            roster_url = f"https://fantasysports.yahooapis.com/fantasy/v2/team/{my_team_key}/roster;players.stats=season"
+            res = await client.get(roster_url)
+            res.raise_for_status()
+            
+            team_data = res.json()['fantasy_content']['team'][1]
+            roster_wrapper = team_data.get('roster', {}).get('0', {}).get('players', {})
+            
+            players = []
+            projections_df = fetch_2026_projections()
+            
+            if isinstance(roster_wrapper, dict) and 'count' in roster_wrapper:
+                for i in range(safe_int(roster_wrapper['count'])):
+                    if str(i) in roster_wrapper:
+                        p_entry = roster_wrapper[str(i)]['player']
+                        p_meta = _parse_yahoo_resource(p_entry[0])
+                        p_stats_wrapper = p_entry[1] 
+                        
+                        stats = {}
+                        if 'player_stats' in p_stats_wrapper:
+                             for s in p_stats_wrapper['player_stats'].get('stats', []):
+                                 stat = s.get('stat', {})
+                                 if str(stat.get('stat_id')) in STAT_ID_MAP:
+                                     try: stats[STAT_ID_MAP[str(stat.get('stat_id'))]] = float(stat.get('value'))
+                                     except: stats[STAT_ID_MAP[str(stat.get('stat_id'))]] = 0.0
+                        
+                        player_obj = { "id": p_meta.get('player_id'), "name": p_meta.get('name', {}).get('full'), "position": p_meta.get('display_position'), "team": p_meta.get('editorial_team_abbr'), "headshot": p_meta.get('headshot', {}).get('url'), "status": p_meta.get('status'), **stats }
+                        
+                        # Merge Projections if available
+                        if not projections_df.empty:
+                            proj = projections_df[projections_df['name'] == player_obj['name']]
+                            if not proj.empty:
+                                for col in ['R', 'HR', 'RBI', 'SB', 'AVG', 'W', 'L', 'SV', 'K', 'ERA', 'WHIP']:
+                                    if col in proj.columns: player_obj[f"proj_{col}"] = proj.iloc[0][col]
+                        
+                        # Add AI Analysis (Anti-Tilt)
+                        try:
+                            # Check if we have analysis for this player (Hitters mainly)
+                            metrics = get_anti_tilt_metrics(safe_int(player_obj['id']))
+                            if metrics:
+                                # Convert Pydantic model to dict if necessary, or use as is if dict
+                                player_obj['analysis'] = metrics.dict() if hasattr(metrics, 'dict') else metrics
+                        except Exception:
+                            pass # Fail silently for individual player analysis to keep roster loading
+                        players.append(player_obj)
+            return players
+        except Exception as e:
+            print(f"Error fetching team: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 app.include_router(router)

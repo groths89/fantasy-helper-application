@@ -1,5 +1,5 @@
 import React from 'react';
-import { Radar, RadarChart, PolarGrid, PolarAngleAxis, ResponsiveContainer, Legend, Tooltip, LabelList } from 'recharts';
+import { Radar, RadarChart, PolarGrid, PolarAngleAxis, ResponsiveContainer, Legend, Tooltip, PolarRadiusAxis } from 'recharts';
 
 const COLORS = [
   '#8884d8', '#82ca9d', '#ffc658', '#ff7300', '#0088FE', 
@@ -24,32 +24,36 @@ const TeamBalanceRadar = ({ team }) => {
   ];
 
   const chartData = categories.map(cat => {
-    const entry = { subject: cat.name };
-    team.forEach(player => {
-      const isPitcher = ['SP', 'RP', 'P'].includes(player.position);
+    const entry = { subject: cat.name, fullMark: 100 };
+
+    team.forEach((player, index) => {
+      const isPitcher = ['SP', 'RP', 'P'].some(pos => (player.position || '').includes(pos));
+      
       let score = 0;
       if ((cat.type === 'hitter' && !isPitcher) || (cat.type === 'pitcher' && isPitcher)) {
-        const playerStat = player[cat.key] || 0;
-        score = Math.round(cat.scale(playerStat)); // Round to integer for cleaner display
+        const playerStat = Number(player[cat.key]) || 0;
+        score = Math.max(0, Math.min(100, cat.scale(playerStat)));
       }
-      entry[String(player.id)] = score;
+      entry[`p-${index}`] = score;
     });
+    
     return entry;
   });
 
   return (
-    <div className="h-72 w-full">
+    <div className="h-[500px] w-full">
       <ResponsiveContainer width="100%" height="100%">
-        <RadarChart cx="50%" cy="50%" outerRadius="80%" data={chartData}>
+        <RadarChart cx="50%" cy="40%" outerRadius="70%" data={chartData}>
           <PolarGrid stroke="#e5e7eb" />
           <PolarAngleAxis dataKey="subject" tick={{ fill: '#6B7280', fontSize: 12 }} />
-          <Tooltip contentStyle={{ backgroundColor: 'rgba(255, 255, 255, 0.8)', border: '1px solid #ccc', borderRadius: '5px' }} />
-          <Legend iconSize={10} wrapperStyle={{ fontSize: '12px' }} />
+          <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
+          <Tooltip contentStyle={{ backgroundColor: 'rgba(255, 255, 255, 0.95)', border: '1px solid #ccc', borderRadius: '5px' }} itemStyle={{ fontSize: 12 }} />
+          <Legend wrapperStyle={{ paddingTop: '20px', maxHeight: '140px', overflowY: 'auto' }} />
           {team.map((player, index) => (
             <Radar
-              key={player.id}
+              key={`radar-${index}`}
               name={player.name}
-              dataKey={String(player.id)}
+              dataKey={`p-${index}`}
               stroke={COLORS[index % COLORS.length]}
               fill={COLORS[index % COLORS.length]}
               fillOpacity={0.2}

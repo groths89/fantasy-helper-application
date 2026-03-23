@@ -12,8 +12,8 @@ const MatchupCard = ({ matchup }) => {
         <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">Week 1 Matchup</span>
         <span className="text-xs font-medium text-blue-600 hover:underline">Full Scoreboard &rarr;</span>
       </div>
-      <div className="p-6 flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <div className="p-6 flex flex-col md:flex-row items-center justify-between gap-6 md:gap-0">
+        <div className="flex items-center gap-4 w-full md:w-auto justify-center md:justify-start">
           {matchup.team_logo ? (
             <img src={matchup.team_logo} alt={matchup.team_name} className="w-14 h-14 rounded-full border-2 border-gray-200 object-cover" />
           ) : (
@@ -34,7 +34,7 @@ const MatchupCard = ({ matchup }) => {
                 <div className="text-xs font-bold text-red-600 bg-red-50 px-2 py-0.5 rounded mt-1">Losing</div>
             )}
         </div>
-        <div className="flex items-center gap-4 text-right">
+        <div className="flex items-center gap-4 text-right w-full md:w-auto justify-center md:justify-end">
           <div>
             <div className="font-bold text-lg leading-none text-gray-900">{matchup.opponent_name}</div>
             <div className="text-sm text-gray-500 mt-1">{matchup.opponent_owner} ({matchup.opponent_record})</div>
