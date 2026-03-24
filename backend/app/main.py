@@ -3,6 +3,8 @@ import time
 import datetime
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, APIRouter, Query, Request
+import logging
+import sys
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -14,13 +16,16 @@ from io import StringIO
 import httpx
 import asyncio
 import urllib.parse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Import from the apps logic
 from app.auth import yahoo_client, save_token, get_token, get_valid_token, TOKEN_FILE
 from app.engine.sgp import engine
 from app.engine.projections import fetch_2026_projections
 from app.engine.statcast import get_anti_tilt_metrics
-from app.engine.ai_assistant import generate_recommendations
+from app.engine.ai_assistant import generate_recommendations, generate_lineup_recommendations
 from app.engine.points_calc import PointsEngine
 from app.logging_service import get_bot_logs
 
@@ -30,6 +35,14 @@ points_engine = PointsEngine()
 router = APIRouter()
 
 app = FastAPI(title="Fantasy Baseball Helper API")
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.DEBUG if os.getenv("DEBUG", "").lower() == "true" else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -130,6 +143,27 @@ def calculate_weekly_projection(roster_names: List[str], projections_df: pd.Data
     # (This assumes standard scoring roughly aligns with SGP-weighted-like magnitude or just uses raw sums if available)
     # For better accuracy, we re-implement the points calc briefly:
     return points_engine.calculate_team_season_points(team_df)
+
+@router.get("/api/v1/settings/scoring")
+async def get_scoring_settings():
+    """Get current scoring weights."""
+    return {
+        "hitter": points_engine.hitter_weights,
+        "pitcher": points_engine.pitcher_weights
+    }
+
+@router.post("/api/v1/settings/scoring")
+async def update_scoring_settings(settings: Dict[str, Dict[str, float]]):
+    """Update scoring weights."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(os.path.join(DATA_DIR, 'scoring_settings.json'), 'w') as f:
+            json.dump(settings, f, indent=2)
+        
+        points_engine.load_settings() # Reload immediately
+        return {"message": "Scoring settings updated successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- Endpoints ---
 @router.get("/bot/logs", response_model=List[Dict[str, Any]], tags=["bot"])
@@ -271,7 +305,7 @@ async def get_rankings(scoring: str = 'h2h', skip: int = 0, limit: int = 5000):
 
     return paginated_df.to_dict(orient='records')
   except Exception as e:
-    print(f"ERROR: {e}")
+    logger.exception(f"Error generating rankings: {e}")
     raise HTTPException(status_code=500, detail=str(e))
   
 @app.post("/api/v1/draft/recommendations")
@@ -290,8 +324,7 @@ async def get_ai_recommendations(request: RecommendationRequest):
         )
         return recommendations
     except Exception as e:
-        # Using print for simple logging; a real app would use a logging library
-        print(f"ERROR in AI Recommendations: {e}")
+        logger.exception(f"Error in AI Recommendations: {e}")
         # Return a generic error to the client
         raise HTTPException(status_code=500, detail="An error occurred while generating recommendations.")
 
@@ -403,7 +436,7 @@ async def get_live_draft(request: Request, team_key: Optional[str] = Query(None)
                     results.append({ "pick": safe_int(pick_wrapper.get('pick')), "round": safe_int(pick_wrapper.get('round')), "player": player_details, "by": "me" if is_me else "opponent" })
             return sorted(results, key=lambda x: x['pick'])
         except Exception as e:
-            print(f"Error fetching live draft: {e}")
+            logger.exception(f"Error fetching live draft: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/projections/upload/{player_type}")
@@ -442,6 +475,7 @@ async def upload_projections(player_type: str, file: UploadFile = File(...)):
     with open(csv_path, "wb") as buffer:
         buffer.write(contents)
   except Exception as e:
+      logger.exception(f"Could not save file: {e}")
       raise HTTPException(status_code=500, detail=f"Could not save file: {e}")
 
   return {"message": f"Successfully uploaded {player_type} projections from {file.filename}."}
@@ -684,10 +718,10 @@ async def get_dashboard(
     
     # If we're using the mock token, return the mock dashboard data
     if token.get("access_token") == "mock_access_token":
-        print("DEBUG: Using mock access token. Returning mock dashboard data.")
+        logger.debug("Using mock access token. Returning mock dashboard data.")
         return await get_dashboard_mock()
 
-    print(f"DEBUG: Attempting Yahoo API call with token ending in ...{token.get('access_token', '')[-5:]}")
+    logger.debug(f"Attempting Yahoo API call with token ending in ...{token.get('access_token', '')[-5:]}")
 
     async with httpx.AsyncClient(timeout=10.0,
         headers={"Authorization": f"Bearer {token['access_token']}"},
@@ -985,6 +1019,7 @@ async def get_dashboard(
             roster_raw = team_data.get('roster', {}).get('0', {}).get('players', {})
 
             my_roster_player_names = []
+            my_roster_players = []
             
             if isinstance(roster_raw, dict) and 'count' in roster_raw:
                 for i in range(safe_int(roster_raw['count'])):
@@ -992,6 +1027,12 @@ async def get_dashboard(
                         player_data_raw = roster_raw[str(i)]['player'][0]
                         player_data = _parse_yahoo_resource(player_data_raw)
                         my_roster_player_names.append(player_data['name']['full'])
+                        my_roster_players.append({
+                            'name': player_data['name']['full'],
+                            'team': player_data.get('editorial_team_abbr', '').upper(),
+                            'player_id': player_data.get('player_id'),
+                            'display_position': player_data.get('display_position') or ''
+                        })
 
             # 5b. Get Opponent Roster & Calculate Win Probability
             win_probability = 50.0
@@ -1107,30 +1148,65 @@ async def get_dashboard(
             except Exception as e:
                 print(f"Warning: Failed to fetch FA recommendations: {e}")
 
-            # C. Analyze Player (Anti-Tilt)
-            # Only run if we have players and projections
-            if my_roster_player_names and os.path.exists(os.path.join(DATA_DIR, 'hitter_projections.csv')):
-                projections_df = fetch_2026_projections()
-                # Limit to avoid too many recommendations
-                recs_generated = 0
-                for player_name in my_roster_player_names:
-                    if recs_generated >= 3: # Limit to 3 recommendations
-                        break
-                    
-                    player_row = projections_df.loc[projections_df['name'] == player_name]
-                    if not player_row.empty:
-                        player_id = int(player_row.iloc[0]['id'])
+            # C. Start/Sit & Anti-Tilt Analysis
+            if my_roster_players:
+                # 1. Fetch Schedule for today
+                schedule_map = {}
+                try:
+                    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+                    # Hydrate with probablePitcher to get starting pitching info
+                    sch_url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={today_str}&hydrate=probablePitcher"
+                    sch_res = await client.get(sch_url)
+                    if sch_res.status_code == 200:
+                        data = sch_res.json()
+                        dates = data.get('dates') if data else []
                         
-                        # Generate anti-tilt metrics for this player
-                        anti_tilt_metrics = get_anti_tilt_metrics(player_id)
-                        if anti_tilt_metrics and anti_tilt_metrics.get('recommendation'):
-                            recommendations.append({
-                                "type": "success" if "unlucky" in anti_tilt_metrics['recommendation'].lower() else "warning",
-                                "message": f"{player_name}: {anti_tilt_metrics['recommendation']}",
-                                "player_id": player_id,
-                                "player_name": player_name
-                            })
-                            recs_generated += 1
+                        games = []
+                        if isinstance(dates, list) and len(dates) > 0:
+                            games_node = dates[0].get('games')
+                            if isinstance(games_node, list):
+                                games = games_node
+
+                        for g in games:
+                            if not isinstance(g, dict): continue
+                            home_data = g['teams']['home']
+                            away_data = g['teams']['away']
+                            home = home_data['team'].get('abbreviation')
+                            away = away_data['team'].get('abbreviation')
+                            
+                            # Safe access for probablePitcher
+                            prob_home = home_data.get('probablePitcher')
+                            home_pitcher = prob_home.get('fullName') if isinstance(prob_home, dict) else None
+                            
+                            prob_away = away_data.get('probablePitcher')
+                            away_pitcher = prob_away.get('fullName') if isinstance(prob_away, dict) else None
+                            
+                            if home: schedule_map[home] = {'opponent': away, 'is_home': True, 'opp_pitcher': away_pitcher}
+                            if away: schedule_map[away] = {'opponent': home, 'is_home': False, 'opp_pitcher': home_pitcher}
+                except Exception as e:
+                    print(f"Schedule fetch failed: {e}")
+
+                # 2. Fetch Metrics (Batched or Iterative)
+                # For now, we iterate. In a large scale app, we'd batch this.
+                anti_tilt_map = {}
+                for p in my_roster_players:
+                    try:
+                        pid = safe_int(p['player_id'])
+                        # We prioritize Pitchers for start/sit advice as it's more critical
+                        is_pitcher = any(x in p['display_position'] for x in ['SP', 'RP', 'P'])
+                        
+                        # Always fetch for pitchers, fetch for hitters if we have capacity (limiting to first 5 hitters to save time/calls)
+                        if is_pitcher or len(anti_tilt_map) < 8: 
+                            metrics = get_anti_tilt_metrics(pid)
+                            if metrics:
+                                anti_tilt_map[pid] = metrics
+                    except Exception:
+                        continue
+
+                # 3. Generate Start/Sit Recommendations
+                lineup_recs = generate_lineup_recommendations(my_roster_players, schedule_map, anti_tilt_map)
+                if lineup_recs:
+                    recommendations.extend(lineup_recs)
 
             # 7. Get Recent Transactions (Activity Feed)
             transactions_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{my_league_key}/transactions;types=add,drop,trade;count=8"
@@ -1153,15 +1229,13 @@ async def get_dashboard(
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
                 raise HTTPException(status_code=401, detail="Yahoo token expired or invalid. Please re-authenticate.")
-            print(f"Yahoo API Error: {e.response.text}")
+            logger.error(f"Yahoo API Error: {e.response.text}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Error fetching data from Yahoo: {e.response.text}")
         except (KeyError, IndexError) as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error parsing Yahoo API response: {e}")
+            logger.exception(f"Error parsing Yahoo API response: {e}")
             raise HTTPException(status_code=500, detail="Error parsing data from Yahoo. The API response structure may have changed.")
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+            logger.exception(f"An unexpected error occurred: {e}")
             raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
 @app.get("/api/v1/league/transactions")
@@ -1246,7 +1320,7 @@ async def get_league_transactions(
         except HTTPException as he:
             raise he
         except Exception as e:
-            print(f"Error fetching transactions: {e}")
+            logger.exception(f"Error fetching transactions: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/dashboard/mock")
@@ -1388,12 +1462,24 @@ async def get_matchup_details(
                         responses[key] = None
 
                 # Load projections for ID mapping
+                # Also calculate points map for roster optimization
+                projections_df = pd.DataFrame()
+                name_to_id = {}
+                name_to_points = {}
+                
+                # Calculate "Rest of Week/Season" factor early
+                current_day = datetime.datetime.now().weekday() # 0=Mon, 6=Sun
+                days_remaining = max(1, 7 - current_day)
+                time_factor = days_remaining / 182.0 # Approx season fraction
+
                 try:
                     projections_df = fetch_2026_projections()
+                    if 'total_points' not in projections_df.columns:
+                        projections_df = _calculate_dataframe_points(projections_df)
                     name_to_id = dict(zip(projections_df['name'], projections_df['id']))
+                    name_to_points = dict(zip(projections_df['name'], projections_df['total_points']))
                 except Exception:
-                    projections_df = pd.DataFrame()
-                    name_to_id = {}
+                    pass
 
                 # Helper to extract roster details
                 def _extract_roster_detailed(json_data):
@@ -1408,12 +1494,22 @@ async def get_matchup_details(
                                     
                                     # Find selected position (starting slot)
                                     current_slot = "BN"
+                                    eligible = []
                                     if isinstance(player_wrapper, list):
                                         for item in player_wrapper:
                                             if isinstance(item, dict) and 'selected_position' in item:
                                                 current_slot = item['selected_position'][1].get('position')
+                                            if isinstance(item, dict) and 'eligible_positions' in item:
+                                                # Yahoo format: {'eligible_positions': [{'position': 'C'}, {'position': '1B'}]}
+                                                eps = item['eligible_positions']
+                                                if isinstance(eps, list):
+                                                    eligible = [e.get('position') for e in eps]
+                                                elif isinstance(eps, dict) and 'position' in eps:
+                                                    eligible = [eps['position']]
                                     
                                     p_name = p_meta.get('name', {}).get('full', 'Unknown')
+                                    p_points = name_to_points.get(p_name, 0.0) * time_factor
+
                                     players.append({
                                         'name': p_name,
                                         'team': p_meta.get('editorial_team_abbr', '').upper(),
@@ -1421,6 +1517,8 @@ async def get_matchup_details(
                                         'headshot': p_meta.get('headshot', {}).get('url'),
                                         'status': p_meta.get('status'),
                                         'current_slot': current_slot,
+                                        'eligible_positions': eligible,
+                                        'projected_points': p_points,
                                         'id': name_to_id.get(p_name)
                                     })
                     return players
@@ -1428,8 +1526,12 @@ async def get_matchup_details(
                 opp_roster_details = _extract_roster_detailed(responses.get("opp_roster"))
                 my_roster_details = _extract_roster_detailed(responses.get("my_roster"))
 
-                my_roster_names = [p['name'] for p in my_roster_details]
-                opp_roster_names = [p['name'] for p in opp_roster_details]
+                inactive_slots = {'BN', 'IL', 'DL', 'NA'}
+                my_roster_names = [p['name'] for p in my_roster_details if p['current_slot'] not in inactive_slots]
+                opp_roster_names = [p['name'] for p in opp_roster_details if p['current_slot'] not in inactive_slots]
+                
+                my_bench_names = [p['name'] for p in my_roster_details if p['current_slot'] == 'BN']
+                opp_bench_names = [p['name'] for p in opp_roster_details if p['current_slot'] == 'BN']
 
                 # Helper to extract stats
                 def _extract_stats(json_data):
@@ -1493,6 +1595,8 @@ async def get_matchup_details(
                 # New variables for total score projection
                 my_final_proj_score = 0.0
                 opp_final_proj_score = 0.0
+                my_bench_rem_points = 0.0
+                opp_bench_rem_points = 0.0
                 win_prob = 50.0
 
                 try:
@@ -1510,10 +1614,6 @@ async def get_matchup_details(
                     opp_projected = _calc_proj(opp_roster_names)
                     
                     # --- AI PREDICTION LOGIC ---
-                    # Calculate "Rest of Week" factor
-                    current_day = datetime.datetime.now().weekday() # 0=Mon, 6=Sun
-                    days_remaining = max(1, 7 - current_day)
-                    time_factor = days_remaining / 182.0 # Approx season fraction
                     
                     def _get_season_points_sum(names):
                         if not names: return 0.0
@@ -1524,6 +1624,9 @@ async def get_matchup_details(
 
                     my_rem_points = _get_season_points_sum(my_roster_names) * time_factor
                     opp_rem_points = _get_season_points_sum(opp_roster_names) * time_factor
+                    
+                    my_bench_rem_points = _get_season_points_sum(my_bench_names) * time_factor
+                    opp_bench_rem_points = _get_season_points_sum(opp_bench_names) * time_factor
                     
                     my_current_score = float(my_points.get('total', 0))
                     opp_current_score = float(opp_points.get('total', 0))
@@ -1573,14 +1676,18 @@ async def get_matchup_details(
                     "projections": {
                         "my_total": my_final_proj_score,
                         "opp_total": opp_final_proj_score,
-                        "win_probability": win_prob
+                        "win_probability": win_prob,
+                        "my_starters_remaining": my_rem_points,
+                        "my_bench_remaining": my_bench_rem_points,
+                        "opp_starters_remaining": opp_rem_points,
+                        "opp_bench_remaining": opp_bench_rem_points
                     }
                 }
             
             raise HTTPException(status_code=404, detail="No active matchup found.")
 
         except Exception as e:
-            print(f"Error in matchup details: {e}")
+            logger.exception(f"Error in matchup details: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/mlb/scores")
@@ -1630,7 +1737,7 @@ async def get_mlb_scores():
                 games.append(game_info)
         return games
     except Exception as e:
-        print(f"Error fetching MLB scores: {e}")
+        logger.exception(f"Error fetching MLB scores: {e}")
         return []
 
 @app.get("/api/v1/team")
@@ -1713,7 +1820,7 @@ async def get_team(request: Request, team_key: Optional[str] = Query(None)):
                         players.append(player_obj)
             return players
         except Exception as e:
-            print(f"Error fetching team: {e}")
+            logger.exception(f"Error fetching team: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 app.include_router(router)

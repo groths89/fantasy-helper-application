@@ -19,9 +19,9 @@ def fetch_2026_projections():
     df_pitchers = pd.read_csv(pitcher_path)
 
     # --- Data Cleaning & Renaming ---
-    # Standardize column names from FantasyPros: 'Player' and 'Positions'
-    df_hitters = df_hitters.rename(columns={'Player': 'name', 'Positions': 'position'})
-    df_pitchers = df_pitchers.rename(columns={'Player': 'name', 'Positions': 'position'})
+    # Standardize column names from FantasyPros: 'Player', 'Positions', 'Team'
+    df_hitters = df_hitters.rename(columns={'Player': 'name', 'Positions': 'position', 'Team': 'team'})
+    df_pitchers = df_pitchers.rename(columns={'Player': 'name', 'Positions': 'position', 'Team': 'team'})
 
     # Pre-process Pitcher columns to prevent collision with Hitter stats
     # We rename conflicting Pitcher stats to *_allowed
@@ -53,7 +53,16 @@ def fetch_2026_projections():
     # Create a unique ID. Using index is a safe bet.
     df['id'] = df.index
 
-    # Coalesce position info from both files
+    # Coalesce team and position info from both files
+    if 'team_h' in df.columns and 'team_p' in df.columns:
+        df['team'] = df['team_h'].combine_first(df['team_p'])
+    elif 'team_h' in df.columns:
+        df['team'] = df['team_h']
+    elif 'team_p' in df.columns:
+        df['team'] = df['team_p']
+    else:
+        df['team'] = 'UNK'
+
     if 'position_h' in df.columns and 'position_p' in df.columns:
         df['position'] = df['position_h'].combine_first(df['position_p'])
     elif 'position_h' in df.columns: # Only hitters have positions
@@ -66,17 +75,14 @@ def fetch_2026_projections():
     # Ensure position is a string, default to 'Util' if it's missing
     df['position'] = df['position'].fillna('Util')
 
-    # Unify Strikeouts (SO for hitters, K for pitchers) into a single 'SO' column
-    # For two-way players, this will sum their hitting and pitching strikeouts.
-    hitter_so = df['SO'].fillna(0) if 'SO' in df.columns else 0
-    pitcher_k = df['K'].fillna(0) if 'K' in df.columns else 0
-    df['SO'] = hitter_so + pitcher_k
+    # NOTE: We keep 'SO' (Hitters) and 'K' (Pitchers) separate to apply different scoring weights
+    # SO = Batter Strikeout (Negative points), K = Pitcher Strikeout (Positive points)
 
     # Ensure all expected stat columns exist and are numeric, filling NaNs with 0
     # This list should contain all stats used for SGP and Points calculations
     stat_cols = [
-        'AB', 'R', 'H', '1B', '2B', '3B', 'HR', 'RBI', 'SB', 'BB', 'AVG', # Hitting
-        'W', 'L', 'SV', 'HLD', 'IP', 'ERA', 'WHIP', 'ER', # Pitching
+        'AB', 'R', 'H', '1B', '2B', '3B', 'HR', 'RBI', 'SB', 'BB', 'HBP', 'AVG', # Hitting
+        'W', 'L', 'SV', 'HLD', 'BSV', 'IP', 'ERA', 'WHIP', 'ER', 'CG', 'SHO', 'K', # Pitching (K is pitcher strikeouts)
         'H_allowed', 'BB_allowed',
         'SO' # Shared
     ]
@@ -87,7 +93,7 @@ def fetch_2026_projections():
             df[col] = 0
 
     # Select and order final columns
-    final_cols = ['id', 'name', 'position'] + [col for col in stat_cols if col in df.columns]
+    final_cols = ['id', 'name', 'position', 'team'] + [col for col in stat_cols if col in df.columns]
     df = df[final_cols]
 
     return df

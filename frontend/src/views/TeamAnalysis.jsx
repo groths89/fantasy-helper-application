@@ -1,29 +1,92 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
-import { User, Activity, Zap, TrendingUp } from 'lucide-react';
+import { User, Activity, Zap, TrendingUp, Lightbulb, AlertTriangle, CheckCircle } from 'lucide-react';
 import TeamBalanceRadar from '../components/TeamBalanceRadar';
 import AnalyzePlayerModal from '../components/AnalyzePlayerModal';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
+const LuckIndicator = ({ analysis }) => {
+  if (!analysis) return null;
+  const { patience_score, luck_delta, recommendation, is_pitcher } = analysis;
+  
+  // Determine color based on score (High score = Unlucky/Buy = Green)
+  let color = "bg-yellow-500";
+  let textColor = "text-yellow-700";
+  if (patience_score >= 60) { color = "bg-green-500"; textColor = "text-green-700"; }
+  else if (patience_score <= 40) { color = "bg-red-500"; textColor = "text-red-700"; }
+
+  return (
+    <div className="w-36">
+        <div className="flex justify-between text-[10px] font-bold uppercase mb-1 items-center">
+            <span className={textColor}>{recommendation}</span>
+            <span className="text-gray-400 text-[9px]">{patience_score}/100</span>
+        </div>
+        <div className="w-full bg-gray-200 rounded-full h-1.5 mb-1">
+            <div className={`${color} h-1.5 rounded-full transition-all duration-500`} style={{ width: `${patience_score}%` }}></div>
+        </div>
+        <div className="text-[9px] text-gray-400 text-right">
+            Luck Δ: {luck_delta > 0 ? '+' : ''}{luck_delta.toFixed(3)}
+        </div>
+    </div>
+  );
+};
+
 export default function TeamAnalysis() {
   const [players, setPlayers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [analyzePlayer, setAnalyzePlayer] = useState(null);
+  const [dashboardRecs, setDashboardRecs] = useState([]);
 
   useEffect(() => {
-    const fetchTeam = async () => {
+    const fetchData = async () => {
+      setLoading(true);
       try {
-        const res = await axios.get(`${API_BASE_URL}/api/v1/team`, { withCredentials: true });
-        setPlayers(res.data);
+        // Fetch both team data and dashboard recommendations in parallel
+        const [teamRes, dashRes] = await Promise.all([
+          axios.get(`${API_BASE_URL}/api/v1/team`, { withCredentials: true }),
+          axios.get(`${API_BASE_URL}/api/v1/dashboard`, { withCredentials: true })
+        ]);
+
+        setPlayers(teamRes.data);
+
+        if (dashRes.data.strategy && dashRes.data.strategy.recommendations) {
+            const dailyRecs = dashRes.data.strategy.recommendations.filter(r =>
+                r.message.toLowerCase().includes('start') ||
+                r.message.toLowerCase().includes('sit') ||
+                r.message.toLowerCase().includes('matchup') ||
+                r.message.toLowerCase().includes('stream')
+            );
+            setDashboardRecs(dailyRecs);
+        }
       } catch (err) {
-        console.error("Failed to load team", err);
+        console.error("Failed to load team data", err);
       } finally {
         setLoading(false);
       }
     };
-    fetchTeam();
+    fetchData();
   }, []);
+
+  const getIcon = (type) => {
+      switch (type) {
+          case 'warning': return <AlertTriangle size={16} className="text-orange-600 mt-0.5 shrink-0" />;
+          case 'alert': return <AlertTriangle size={16} className="text-red-600 mt-0.5 shrink-0" />;
+          case 'success': return <CheckCircle size={16} className="text-green-600 mt-0.5 shrink-0" />;
+          case 'info': return <Lightbulb size={16} className="text-blue-600 mt-0.5 shrink-0" />;
+          default: return <Lightbulb size={16} className="text-yellow-500 fill-yellow-400 mt-0.5 shrink-0" />;
+      }
+  };
+
+  const getBgColor = (type) => {
+      switch (type) {
+          case 'warning': return 'bg-orange-50 border-orange-100 text-orange-800';
+          case 'alert': return 'bg-red-50 border-red-100 text-red-800';
+          case 'success': return 'bg-green-50 border-green-100 text-green-800';
+          case 'info': return 'bg-blue-50 border-blue-100 text-blue-800';
+          default: return 'bg-white border-gray-100 text-gray-700';
+      }
+  };
 
   if (loading) return <div className="p-8 text-center text-gray-500">Loading your roster...</div>;
 
@@ -44,8 +107,10 @@ export default function TeamAnalysis() {
         );
     }
 
-    const buys = analyzed.filter(p => p.analysis.luck_delta > 0).sort((a,b) => b.analysis.luck_delta - a.analysis.luck_delta);
-    const sells = analyzed.filter(p => p.analysis.luck_delta < 0);
+    // High Patience Score (>60) means Unlucky -> Buy
+    // Low Patience Score (<40) means Lucky -> Sell
+    const buys = analyzed.filter(p => p.analysis.patience_score >= 60).sort((a,b) => b.analysis.patience_score - a.analysis.patience_score);
+    const sells = analyzed.filter(p => p.analysis.patience_score <= 40);
     const topBuy = buys[0];
 
     return (
@@ -56,7 +121,11 @@ export default function TeamAnalysis() {
             </p>
             {topBuy && (
                 <div className="bg-white/60 p-2 rounded border border-blue-100 text-xs md:text-sm">
-                    <span className="font-bold text-green-700">💎 Diamond Hands:</span> <strong>{topBuy.name}</strong> is your unluckiest player with a +{topBuy.analysis.luck_delta.toFixed(3)} gap between Expected and Actual Batting Average. Positive regression is likely coming—do not drop him!
+                    <span className="font-bold text-green-700">💎 Diamond Hands:</span> <strong>{topBuy.name}</strong> has a Patience Score of {topBuy.analysis.patience_score}/100. 
+                    {topBuy.analysis.is_pitcher 
+                        ? ` His actual wOBA is significantly higher than his expected wOBA (+${topBuy.analysis.luck_delta}). Better days are ahead.`
+                        : ` His expected stats suggest he is getting unlucky (+${topBuy.analysis.luck_delta} delta). Keep him in the lineup.`
+                    }
                 </div>
             )}
         </div>
@@ -77,12 +146,12 @@ export default function TeamAnalysis() {
   const getRowStyle = (player) => {
     if (!player.analysis) return "hover:bg-blue-50/30 transition-colors group";
     
-    // Luck Delta > 0 means xStats > Actual Stats (Unlucky -> Good Buy/Hold)
-    if (player.analysis.luck_delta > 0) {
+    // Score > 60 means Unlucky (Green/Buy)
+    if (player.analysis.patience_score >= 60) {
         return "bg-green-50 hover:bg-green-100 transition-colors group border-l-4 border-green-500";
     }
-    // Luck Delta < 0 means Actual Stats > xStats (Lucky -> Sell High/Warning)
-    if (player.analysis.luck_delta < 0) {
+    // Score < 40 means Lucky (Red/Sell)
+    if (player.analysis.patience_score <= 40) {
         return "bg-red-50 hover:bg-red-100 transition-colors group border-l-4 border-red-500";
     }
     return "hover:bg-blue-50/30 transition-colors group";
@@ -100,7 +169,7 @@ export default function TeamAnalysis() {
             <tr className="bg-gray-50 text-xs text-gray-500 border-b border-gray-200">
               <th className="px-6 py-2 text-left">Player</th>
               {stats.map(s => <th key={s} className="px-4 py-2 text-center">{s}</th>)}
-              <th className="px-4 py-2 text-center">Action</th>
+              <th className="px-4 py-2 text-center w-48">Statcast Analysis</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -117,14 +186,6 @@ export default function TeamAnalysis() {
                         <span className="font-semibold text-blue-600">{p.position}</span>
                         <span>{p.team}</span>
                         {p.status && p.status !== 'OK' && <span className="text-red-500 font-bold">{p.status}</span>}
-                        {p.analysis && (
-                            <span 
-                                title={p.analysis.recommendation}
-                                className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase cursor-help ${p.analysis.luck_delta > 0 ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'}`}
-                            >
-                                {p.analysis.luck_delta > 0 ? 'Buy' : 'Sell'}
-                            </span>
-                        )}
                       </div>
                     </div>
                   </div>
@@ -133,13 +194,17 @@ export default function TeamAnalysis() {
                     <StatCell key={s} label={s} val={p[s]} proj={p[`proj_`]} />
                 ))}
                 <td className="px-4 py-3 text-center">
-                    <button 
-                        onClick={() => setAnalyzePlayer(p)}
-                        className="text-purple-600 hover:text-purple-800 bg-purple-50 hover:bg-purple-100 p-2 rounded-full transition-colors"
-                        title="Run Anti-Tilt Analysis"
-                    >
-                        <Zap size={16} />
-                    </button>
+                    {p.analysis ? (
+                        <LuckIndicator analysis={p.analysis} />
+                    ) : (
+                        <button 
+                            onClick={() => setAnalyzePlayer(p)}
+                            className="text-purple-600 hover:text-purple-800 bg-purple-50 hover:bg-purple-100 p-2 rounded-full transition-colors"
+                            title="Run Anti-Tilt Analysis"
+                        >
+                            <Zap size={16} />
+                        </button>
+                    )}
                 </td>
               </tr>
             ))}
@@ -159,6 +224,22 @@ export default function TeamAnalysis() {
             <p className="text-gray-500 text-sm mt-1">Deep dive into your roster performance and projections.</p>
         </div>
       </div>
+
+      {dashboardRecs.length > 0 && (
+        <div className="mb-8 bg-white p-6 rounded-lg shadow-sm border border-gray-200">
+            <h3 className="font-bold text-gray-700 mb-3 flex items-center gap-2">
+                <Lightbulb size={18} className="text-yellow-500 fill-yellow-500" /> Daily Start/Sit Briefing
+            </h3>
+            <div className="space-y-2">
+                {dashboardRecs.map((rec, idx) => (
+                    <div key={idx} className={`text-sm p-3 rounded-md border flex gap-3 items-start ${getBgColor(rec.type)}`}>
+                        {getIcon(rec.type)}
+                        <span className="leading-snug">{rec.message}</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
         {/* Radar Chart */}

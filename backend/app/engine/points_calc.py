@@ -1,24 +1,47 @@
+import json
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SETTINGS_FILE = os.path.join(BASE_DIR, 'data', 'scoring_settings.json')
+
 class PointsEngine:
     def __init__(self):
-        # Your specific Yahoo league point values
+        self.load_settings()
+
+    def load_settings(self):
+        # Default values (Standard Yahoo H2H)
         self.hitter_weights = {
-            '1B': 1, '2B': 2, '3B': 3, 'HR': 4,
-            'RBI': 1, 'R': 1, 'SB': 2, 'BB': 1, 
-            'HBP': 1, 'K': -0.5
+            '1B': 1.0, '2B': 2.0, '3B': 3.0, 'HR': 4.0, 'RBI': 1.0, 'R': 1.0, 'SB': 2.0, 'BB': 1.0, 'HBP': 1.0, 'K': -0.5, 'CYC': 4.0
         }
         self.pitcher_weights = {
-            'IP': 1, 'W': 3, 'L': -3, 'SV': 3, 
-            'HLD': 2, 'ER': -0.5, 'K': 0.25, 'QS': 2
+            'IP': 1.0, 'W': 3.0, 'L': -3.0, 'SV': 3.0, 'HLD': 2.0, 'ER': -0.5, 'K': 0.25, 'QS': 2.0, 'CG': 3.0, 'SHO': 4.0, 'BSV': -3.0, 'NH': 3.0, 'PG': 4.0
         }
+
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                    if 'hitter' in data:
+                        self.hitter_weights.update(data['hitter'])
+                    if 'pitcher' in data:
+                        self.pitcher_weights.update(data['pitcher'])
+            except Exception as e:
+                print(f"Error loading scoring settings: {e}")
 
     def calculate_hitter_points(self, proj):
         """Calculates total projected points for a hitter"""
         score = (
-            proj.get('1B', 0) * 1 + proj.get('2B', 0) * 2 + 
-            proj.get('3B', 0) * 3 + proj.get('HR', 0) * 4 +
-            proj.get('RBI', 0) * 1 + proj.get('R', 0) * 1 +
-            proj.get('SB', 0) * 2 + proj.get('BB', 0) * 1 +
-            proj.get('K', 0) * -0.5
+            proj.get('1B', 0) * self.hitter_weights.get('1B', 0) + 
+            proj.get('2B', 0) * self.hitter_weights.get('2B', 0) + 
+            proj.get('3B', 0) * self.hitter_weights.get('3B', 0) + 
+            proj.get('HR', 0) * self.hitter_weights.get('HR', 0) +
+            proj.get('RBI', 0) * self.hitter_weights.get('RBI', 0) + 
+            proj.get('R', 0) * self.hitter_weights.get('R', 0) +
+            proj.get('SB', 0) * self.hitter_weights.get('SB', 0) + 
+            proj.get('BB', 0) * self.hitter_weights.get('BB', 0) +
+            proj.get('HBP', 0) * self.hitter_weights.get('HBP', 0) +
+            proj.get('SO', 0) * self.hitter_weights.get('K', 0) + # Map Proj SO to Settings K
+            proj.get('CYC', 0) * self.hitter_weights.get('CYC', 0)
         )
         return round(score, 1)
 
@@ -30,14 +53,21 @@ class PointsEngine:
         er = proj.get('ER', (era * ip) / 9.0 if ip > 0 else 0)
         
         score = (
-            ip * self.pitcher_weights['IP'] +
-            proj.get('W', 0) * self.pitcher_weights['W'] +
-            proj.get('L', 0) * self.pitcher_weights['L'] +
-            proj.get('SV', 0) * self.pitcher_weights['SV'] +
-            proj.get('HLD', 0) * self.pitcher_weights['HLD'] +
-            er * self.pitcher_weights['ER'] +
-            proj.get('K', 0) * self.pitcher_weights['K'] +
-            proj.get('QS', 0) * self.pitcher_weights['QS']
+            ip * self.pitcher_weights.get('IP', 0) +
+            proj.get('W', 0) * self.pitcher_weights.get('W', 0) +
+            proj.get('L', 0) * self.pitcher_weights.get('L', 0) +
+            proj.get('SV', 0) * self.pitcher_weights.get('SV', 0) +
+            proj.get('HLD', 0) * self.pitcher_weights.get('HLD', 0) +
+            er * self.pitcher_weights.get('ER', 0) +
+            proj.get('K', 0) * self.pitcher_weights.get('K', 0) +
+            proj.get('QS', 0) * self.pitcher_weights.get('QS', 0) +
+            proj.get('CG', 0) * self.pitcher_weights.get('CG', 0) +
+            proj.get('SHO', 0) * self.pitcher_weights.get('SHO', 0) +
+            proj.get('BSV', 0) * self.pitcher_weights.get('BSV', 0) +
+            proj.get('NH', 0) * self.pitcher_weights.get('NH', 0) +
+            proj.get('PG', 0) * self.pitcher_weights.get('PG', 0) +
+            proj.get('H_allowed', 0) * self.pitcher_weights.get('H_allowed', 0) +
+            proj.get('BB_allowed', 0) * self.pitcher_weights.get('BB_allowed', 0)
         )
         return round(score, 1)
 

@@ -1,3 +1,78 @@
+import json
+import os
+import logging
+import pandas as pd
+from app.engine.projections import fetch_2026_projections
+
+# Logger configuration will be inherited from main.py
+logger = logging.getLogger(__name__)
+
+# In-memory cache for settings to avoid recalculation on every call within a single request lifecycle
+_settings_cache = None
+
+def get_matchup_settings():
+    """
+    Dynamically determines strong/weak offenses and aces based on projections.
+    Caches the result in memory for the duration of the app's process.
+    """
+    global _settings_cache
+    if _settings_cache:
+        return _settings_cache
+
+    # Define hardcoded defaults as a fallback in case projections fail
+    defaults = {
+        'STRONG_OFFENSES': {'LAD', 'ATL', 'NYY', 'HOU', 'TEX', 'PHI', 'BAL'},
+        'WEAK_OFFENSES': {'OAK', 'CWS', 'COL', 'WSH', 'MIA', 'LAA'},
+        'ACES': {
+            'Gerrit Cole', 'Spencer Strider', 'Zack Wheeler', 'Corbin Burnes', 
+            'Tarik Skubal', 'Tyler Glasnow', 'Yoshinobu Yamamoto', 'Logan Webb',
+            'Zac Gallen', 'Luis Castillo', 'George Kirby', 'Pablo Lopez', 'Paul Skenes'
+        }
+    }
+    
+    try:
+        df = fetch_2026_projections()
+        if df.empty:
+            _settings_cache = defaults
+            return _settings_cache
+
+        # --- Calculate ACES ---
+        # Filter for starting pitchers with a significant projected workload
+        pitchers_df = df[df['position'].str.contains('SP', na=False) & (df['IP'] >= 100)]
+        
+        # Define Aces as top ~15% in ERA (lower is better) and top ~20% in Strikeouts
+        aces = set()
+        if not pitchers_df.empty:
+            ace_era_threshold = pitchers_df[pitchers_df['ERA'] > 0]['ERA'].quantile(0.15)
+            ace_so_threshold = pitchers_df['SO'].quantile(0.80)
+            
+            aces_df = pitchers_df[
+                (pitchers_df['ERA'] > 0) & (pitchers_df['ERA'] <= ace_era_threshold) & 
+                (pitchers_df['SO'] >= ace_so_threshold)
+            ]
+            aces = set(aces_df['name'])
+
+        # --- Calculate OFFENSES ---
+        team_offense = df[df['team'] != 'UNK'].groupby('team')['R'].sum().sort_values(ascending=False)
+        strong_offenses, weak_offenses = set(), set()
+        if not team_offense.empty:
+            num_teams = len(team_offense)
+            quartile = max(1, num_teams // 4)
+            strong_offenses = set(team_offense.head(quartile).index)
+            weak_offenses = set(team_offense.tail(quartile).index)
+
+        _settings_cache = {
+            'STRONG_OFFENSES': strong_offenses if strong_offenses else defaults['STRONG_OFFENSES'],
+            'WEAK_OFFENSES': weak_offenses if weak_offenses else defaults['WEAK_OFFENSES'],
+            'ACES': aces if aces else defaults['ACES']
+        }
+        return _settings_cache
+
+    except Exception as e:
+        logger.warning(f"Could not dynamically generate matchup settings: {e}. Falling back to defaults.")
+        _settings_cache = defaults
+        return defaults
+
 def generate_recommendations(team, last_drafted, roster_settings, players, all_taken_players):
     """
     Analyzes the draft state and generates contextual recommendations.
@@ -71,5 +146,78 @@ def generate_recommendations(team, last_drafted, roster_settings, players, all_t
     if available_players:
         next_best = available_players[0]
         recs.append({"type": "tip", "message": f"Best value on the board: {next_best['name']} ({next_best['position']})"})
+
+    return recs
+
+def generate_lineup_recommendations(roster, schedule_map, anti_tilt_map):
+    """
+    Generates Start/Sit recommendations based on daily matchups and Statcast metrics.
+    """
+    recs = []
+    
+    # Simple heuristic for opponent strength (could be dynamic in future)
+    settings = get_matchup_settings()
+    STRONG_OFFENSES = settings['STRONG_OFFENSES']
+    WEAK_OFFENSES = settings['WEAK_OFFENSES']
+    ACES = settings['ACES']
+
+    for player in roster:
+        name = player.get('name')
+        team = player.get('team') # editorial_team_abbr
+        pid = player.get('player_id')
+        position = player.get('display_position')
+        if position is None: position = ''
+        
+        # 1. Get Game Info
+        game = schedule_map.get(team)
+        if not game:
+            continue # No game today or team not found in schedule
+            
+        opponent = game.get('opponent', 'UNK')
+        opp_pitcher = game.get('opp_pitcher', '')
+        
+        # 2. Get Advanced Metrics (if available)
+        metrics = anti_tilt_map.get(int(pid)) if pid else None
+        patience_score = metrics['patience_score'] if metrics else 50
+        
+        rec = None
+
+        # --- PITCHER LOGIC ---
+        if any(pos in position for pos in ['SP', 'RP', 'P']):
+            # Strong Opponent Warning
+            if opponent in STRONG_OFFENSES:
+                if patience_score < 60:
+                    rec = {"type": "warning", "message": f"SIT: {name} faces a dangerous {opponent} lineup today."}
+                else:
+                    rec = {"type": "info", "message": f"RISKY START: {name} faces {opponent}, though his underlying metrics are solid."}
+            
+            # Weak Opponent Opportunity
+            elif opponent in WEAK_OFFENSES:
+                rec = {"type": "success", "message": f"START: {name} has a favorable matchup vs {opponent}."}
+            
+            # Luck-based Streaming
+            if not rec and metrics and metrics['luck_delta'] > 0.050:
+                rec = {"type": "success", "message": f"STREAM: {name} is statistically unlucky and due for regression. Good spot vs {opponent}."}
+
+            # Default for Probable Starters
+            if not rec and 'SP' in position:
+                rec = {"type": "info", "message": f"START: {name} faces {opponent}."}
+
+        # --- HITTER LOGIC ---
+        else:
+             # Only recommend Start/Sit for hitters in extreme cases
+             if opp_pitcher in ACES:
+                 rec = {"type": "warning", "message": f"TOUGH MATCHUP: {name} faces ace {opp_pitcher}. Consider benching if you have depth."}
+             elif metrics and metrics['patience_score'] >= 80:
+                 rec = {"type": "success", "message": f"MUST START: {name} is crushing the ball (High xStats). A breakout game is imminent."}
+             elif opponent in WEAK_OFFENSES and patience_score > 60:
+                 rec = {"type": "success", "message": f"Good matchup for {name} vs {opponent}."}
+             else:
+                 # Default Matchup Info
+                 rec = {"type": "info", "message": f"Matchup: {name} vs {opponent} ({opp_pitcher or 'TBD'})."}
+
+        if rec:
+            rec['player_id'] = pid
+            recs.append(rec)
 
     return recs

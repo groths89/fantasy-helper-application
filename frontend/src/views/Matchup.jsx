@@ -3,6 +3,7 @@ import { getMatchupDetails, getAntiTiltMetrics } from '../services/api';
 import { Swords, TrendingUp, TrendingDown, User, Shield, MessageSquare, Share2, Loader, PlayCircle, Calendar, ArrowUpCircle, ArrowDownCircle, Zap } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import AntiTiltModal from '../components/AntiTiltModal';
+import BenchComparisonChart from '../components/BenchComparisonChart';
 
 export default function Matchup() {
   const [data, setData] = useState(null);
@@ -14,6 +15,7 @@ export default function Matchup() {
   const [winProbAnimation, setWinProbAnimation] = useState(0);
   const [tiltPlayer, setTiltPlayer] = useState(null);
   const [tiltMetrics, setTiltMetrics] = useState(null);
+  const [swapRec, setSwapRec] = useState(null);
 
   useEffect(() => {
     async function fetchData() {
@@ -153,6 +155,48 @@ export default function Matchup() {
     setTiltMetrics(null);
   };
 
+  const handleOptimize = () => {
+    if (!my_team || !my_team.roster) return;
+    
+    const roster = my_team.roster;
+    const starters = roster.filter(p => p.current_slot !== 'BN' && p.current_slot !== 'IL' && p.current_slot !== 'DL');
+    const bench = roster.filter(p => p.current_slot === 'BN');
+
+    let bestSwap = null;
+    let maxGain = 0;
+
+    // Iterate through bench players to find a starter they can replace for points gain
+    for (const benchPlayer of bench) {
+        const benchPoints = benchPlayer.projected_points || 0;
+        
+        // Find starters who occupy a slot this bench player is eligible for
+        const eligiblePositions = benchPlayer.eligible_positions || [];
+        
+        for (const starter of starters) {
+            // Check if bench player can take starter's slot
+            // (Assuming Util is always valid for hitters if explicit pos matches fail, but checking specific eligibility is safer)
+            const canSwap = eligiblePositions.includes(starter.current_slot) || 
+                            (starter.current_slot === 'Util' && !['SP', 'RP', 'P'].includes(benchPlayer.position));
+            
+            if (canSwap) {
+                const starterPoints = starter.projected_points || 0;
+                const gain = benchPoints - starterPoints;
+                
+                if (gain > maxGain) {
+                    maxGain = gain;
+                    bestSwap = { bench: benchPlayer, starter: starter, gain: gain };
+                }
+            }
+        }
+    }
+
+    if (bestSwap) {
+        setSwapRec(bestSwap);
+    } else {
+        alert("Lineup looks optimized! No beneficial swaps found based on projections.");
+    }
+  };
+
   const DailyScheduleList = ({ teamName, roster, isMyTeam }) => {
     // Create local state for roster to allow optimistic UI updates
     const [localRoster, setLocalRoster] = useState(roster || []);
@@ -232,6 +276,13 @@ export default function Matchup() {
           
           <div className="flex flex-col items-center px-4">
             <div className="text-gray-400 font-bold italic mb-2">VS</div>
+            <button 
+                onClick={handleOptimize}
+                className="mb-2 flex items-center gap-1 bg-yellow-500 hover:bg-yellow-400 text-white text-xs font-bold px-3 py-1 rounded-full shadow-sm transition-all animate-pulse"
+                title="Recommend Bench Swap"
+            >
+                <Zap size={12} fill="currentColor" /> Smart Swap
+            </button>
             <div className="bg-gray-100 p-1 rounded-lg flex items-center shadow-inner">
                 <button 
                     onClick={() => setScoreMode('live')}
@@ -270,7 +321,20 @@ export default function Matchup() {
             </div>
         </div>
       </div>
-      
+
+        {swapRec && (
+            <div className="bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded-md flex justify-between items-center shadow-sm animate-in slide-in-from-top-2">
+                <div className="flex items-center gap-3">
+                    <div className="bg-yellow-100 p-2 rounded-full text-yellow-600"><Zap size={20} /></div>
+                    <div>
+                        <p className="font-bold text-yellow-800 text-sm">Optimization Alert</p>
+                        <p className="text-sm text-yellow-700">Swap <span className="font-bold">{swapRec.starter.name}</span> ({swapRec.starter.projected_points.toFixed(1)} pts) for <span className="font-bold">{swapRec.bench.name}</span> ({swapRec.bench.projected_points.toFixed(1)} pts) to gain <span className="font-bold text-green-600">+{swapRec.gain.toFixed(1)}</span> projected points.</p>
+                    </div>
+                </div>
+                <button onClick={() => setSwapRec(null)} className="text-yellow-600 hover:text-yellow-800 font-bold text-xs">Dismiss</button>
+            </div>
+        )}
+        
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-white rounded-lg shadow p-4">
           <h3 className="font-bold text-gray-700 mb-4 border-b pb-2">Matchup Insights</h3>
@@ -320,6 +384,10 @@ export default function Matchup() {
         </div>
         </div>
         
+        <div className="grid grid-cols-1">
+            <BenchComparisonChart projections={data.projections} />
+        </div>
+
         {/* Daily Schedule Section */}
         <div className="bg-white rounded-lg shadow p-6">
             <div className="flex items-center gap-2 mb-4 border-b pb-2">

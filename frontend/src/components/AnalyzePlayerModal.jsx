@@ -2,6 +2,32 @@ import React, { useState, useEffect } from 'react';
 import { X, TrendingUp, TrendingDown, Activity, Loader, ExternalLink } from 'lucide-react';
 import { getAntiTiltMetrics } from '../services/api';
 
+const LuckIndicator = ({ analysis }) => {
+  if (!analysis) return null;
+  const { patience_score, luck_delta, recommendation, is_pitcher } = analysis;
+  
+  // Determine color based on score (High score = Unlucky/Buy = Green)
+  let color = "bg-yellow-500";
+  let textColor = "text-yellow-700";
+  if (patience_score >= 60) { color = "bg-green-500"; textColor = "text-green-700"; }
+  else if (patience_score <= 40) { color = "bg-red-500"; textColor = "text-red-700"; }
+
+  return (
+    <div className="w-full bg-gray-50 p-4 rounded-lg border border-gray-100">
+        <div className="flex justify-between text-xs font-bold uppercase mb-2 items-center">
+            <span className={textColor}>{recommendation}</span>
+            <span className="text-gray-500">{patience_score}/100</span>
+        </div>
+        <div className="w-full bg-gray-200 rounded-full h-2 mb-2">
+            <div className={`${color} h-2 rounded-full transition-all duration-500`} style={{ width: `${patience_score}%` }}></div>
+        </div>
+        <div className="text-[10px] text-gray-400 text-right">
+            Luck Δ ({is_pitcher ? 'wOBA - xwOBA' : 'xwOBA - wOBA'}): {luck_delta > 0 ? '+' : ''}{luck_delta.toFixed(3)}
+        </div>
+    </div>
+  );
+};
+
 const AnalyzePlayerModal = ({ player, onClose }) => {
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -52,9 +78,7 @@ const AnalyzePlayerModal = ({ player, onClose }) => {
             </div>
           ) : metrics ? (
             <div className="space-y-4">
-              <div className={`p-4 rounded-lg border-l-4 ${metrics.luck_delta > 0 ? 'bg-green-50 border-green-500' : 'bg-red-50 border-red-500'}`}>
-                <p className="font-medium text-gray-800">{metrics.recommendation}</p>
-              </div>
+              <LuckIndicator analysis={metrics} />
               
               <div className="grid grid-cols-2 gap-4">
                  <div className="bg-gray-50 p-4 rounded-lg text-center border border-gray-100">

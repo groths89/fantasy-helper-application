@@ -1,0 +1,9 @@
+{
+    "STRONG_OFFENSES": ["LAD", "ATL", "NYY", "HOU", "TEX", "PHI", "BAL"],
+    "WEAK_OFFENSES": ["OAK", "CWS", "COL", "WSH", "MIA", "LAA"],
+    "ACES": [
+        "Gerrit Cole", "Spencer Strider", "Zack Wheeler", "Corbin Burnes", 
+        "Tarik Skubal", "Tyler Glasnow", "Yoshinobu Yamamoto", "Logan Webb",
+        "Zac Gallen", "Luis Castillo", "George Kirby", "Pablo Lopez", "Paul Skenes"
+    ]
+}
